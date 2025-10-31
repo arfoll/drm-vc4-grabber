@@ -61,6 +61,33 @@ fn decimate_image_4(size: (usize, usize), image: &[u32], copy: &mut [u32]) {
     }
 }
 
+/// Convert in-place from XRGB2101010/ARGB2101010 to XRGB8888 order.
+/// Input: 0b XX RRRRRRRRRR GGGGGGGGGG BBBBBBBBBB (bits: 31..0)
+/// Output (LE memory): u32 with bytes [BB, GG, RR, 00]
+#[inline]
+fn ten_to_eight(v10: u32) -> (u32, u32, u32) {
+    // Scale 10->8 with rounding: (x*255 + 511)/1023
+    let scale = |x: u32| ((x * 255 + 511) / 1023) & 0xFF;
+    let r10 = (v10 >> 20) & 0x3FF;
+    let g10 = (v10 >> 10) & 0x3FF;
+    let b10 = (v10 >>  0) & 0x3FF;
+    (scale(r10), scale(g10), scale(b10))
+}
+
+fn xr30_to_xr24_inplace(pixels: &mut [u32]) {
+    for p in pixels.iter_mut() {
+        let (r8, g8, b8) = ten_to_eight(*p);
+        // Numeric u32 is 0x00RRGGBB (conventional). In little-endian memory
+        // this becomes bytes [BB, GG, RR, 00], which matches XR24 expectations.
+        *p = (r8 << 16) | (g8 << 8) | (b8 << 0);
+    }
+}
+
+fn ar30_to_ar24_inplace(pixels: &mut [u32]) {
+    // Alpha is ignored for screenshots; drop to XRGB8888 layout.
+    xr30_to_xr24_inplace(pixels);
+}
+
 fn decode_p030_image(
     card: &Card,
     size: (usize, usize),
@@ -210,6 +237,38 @@ fn dump_linear_to_image(
     ))
 }
 
+fn dump_linear_xr30_to_image(
+    card: &Card,
+    pitch: u32,
+    size: (u32, u32),
+    _bpp: u32,
+    handle: u32,
+    verbose: bool,
+) -> Result<RgbImage, SystemError> {
+    // Even though it's 30bpp, DRM buffers are 32-bit words per pixel.
+    let length_words = (pitch * size.1) / 4;
+    println!(
+        "linear XR30, size: {:?}, pitch: {}, words: {}",
+        size, pitch, length_words
+    );
+
+    let mut copy = vec![0u32; length_words as _];
+    copy_buffer(card, handle, &mut copy, verbose)?;
+
+    // Convert XR30→XR24 in place
+    xr30_to_xr24_inplace(&mut copy);
+
+    // Decimate to keep CPU work low (like the XR24 path)
+    let mut dec = vec![0u32; (length_words / (4 * 4)) as _];
+    decimate_image_4((size.0 as _, size.1 as _), copy.as_slice(), dec.as_mut_slice());
+
+    Ok(decode_image(
+        dec.as_mut_slice(),
+        pitch / 4,
+        (size.0 / 4, size.1 / 4),
+    ))
+}
+
 fn dump_rgb565_to_image(
     card: &Card,
     pitch: u32,
@@ -295,6 +354,66 @@ fn dump_yuv420_to_image(
     }
 }
 
+fn dump_intel_xtiled_xr30_to_image(
+    card: &Card,
+    pitch: u32,
+    size: (u32, u32),
+    handle: u32,
+    verbose: bool,
+) -> Result<RgbImage, SystemError> {
+    // Intel X-tiled 32bpp: 128×8 pixels per tile = 4096 bytes
+    const TILE_W: usize = 128;
+    const TILE_H: usize = 8;
+    const TILE_BYTES: usize = 4096;
+
+    let width  = size.0 as usize;
+    let height = size.1 as usize;
+    let pitch_words = pitch as usize / 4;
+
+    if verbose {
+        println!(
+            "intel x-tiled XR30 (final), size={:?}, pitch={}, pitch_words={}",
+            size, pitch, pitch_words
+        );
+    }
+
+    let mut copy = vec![0u32; pitch_words * height];
+    copy_buffer(card, handle, &mut copy, verbose)?;
+    let mut img = RgbImage::new(size.0, size.1);
+
+    let tiles_x = (width + TILE_W - 1) / TILE_W;
+    let tiles_y = (height + TILE_H - 1) / TILE_H;
+    let tiles_per_pitch = pitch as usize / (TILE_W * 4);
+
+    for ty in 0..tiles_y {
+        for tx in 0..tiles_x {
+            let tile_base = (ty * tiles_per_pitch + tx) * (TILE_BYTES / 4);
+
+            for y in 0..TILE_H {
+                let dst_y = ty * TILE_H + y;
+                if dst_y >= height { break; }
+
+                let dst_x = tx * TILE_W;
+                let src_start = tile_base + y * (TILE_W);
+                let src_end = (src_start + TILE_W).min(copy.len());
+                if src_start >= copy.len() { break; }
+
+                for (i, &px) in copy[src_start..src_end].iter().enumerate() {
+                    if dst_x + i >= width { break; }
+                    let (r8, g8, b8) = ten_to_eight(px);
+                    img.put_pixel(
+                        (dst_x + i) as u32,
+                        dst_y as u32,
+                        image::Rgb([r8 as u8, g8 as u8, b8 as u8]),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(img)
+}
+
 pub fn dump_framebuffer_to_image(
     card: &Card,
     fb: Handle,
@@ -352,6 +471,28 @@ pub fn dump_framebuffer_to_image(
             ),
             _ => panic!("Unsupported framebuffer modifier: {:?}", modifier),
         },
+DrmFourcc::Xrgb2101010 => {
+    if fbinfo2.modifier[0] == ((1u64 << 56) | 1) {
+        dump_intel_xtiled_xr30_to_image(
+            card, fbinfo2.pitches[0], size, fbinfo2.handles[0], verbose,
+        )
+    } else {
+        dump_linear_xr30_to_image(
+            card, fbinfo2.pitches[0], size, 32, fbinfo2.handles[0], verbose,
+        )
+    }
+}
+
+        DrmFourcc::Argb2101010 => {
+            dump_linear_xr30_to_image(
+                card,
+                fbinfo2.pitches[0],
+                size,
+                32,
+                fbinfo2.handles[0],
+                verbose,
+            )
+        },
         DrmFourcc::Yuv420 => dump_yuv420_to_image(
             card,
             size,
@@ -384,7 +525,13 @@ pub fn dump_framebuffer_to_image(
         ),
     };
 
-    gem_close(card.as_raw_fd(), fbinfo2.handles[0]).unwrap();
+    if let Err(e) = gem_close(card.as_raw_fd(), fbinfo2.handles[0]) {
+        match e {
+            SystemError::InvalidArgument => { /* ignore EINVAL */ }
+            SystemError::Unknown { errno } if errno == nix::errno::Errno::ENOENT => { /* ignore ENOENT */ }
+            other => eprintln!("gem_close failed: {:?}", other),
+        }
+    }
 
     let image = image_result?;
 
