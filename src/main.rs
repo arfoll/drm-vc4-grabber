@@ -192,18 +192,17 @@ fn main() {
 
         let target_fps = 10.0;
 
-let frame_time = Duration::from_secs_f64(1.0 / target_fps);
-loop {
-    let start = Instant::now();
-    if let Some(fb) = find_framebuffer(&card, verbose) {
-        dump_and_send_framebuffer(&mut socket, &card, fb, verbose).unwrap();
-    }
-    let elapsed = start.elapsed();
-    if elapsed < frame_time {
-        println!("Too fast!");
-        thread::sleep(frame_time - elapsed);
-    }
-}
-
+        let frame_time = Duration::from_secs_f64(1.0 / target_fps);
+        loop {
+            let start = Instant::now();
+            if let Some(fb) = find_framebuffer(&card, verbose) {
+                dump_and_send_framebuffer(&mut socket, &card, fb, verbose).unwrap();
+            }
+            let elapsed = start.elapsed();
+            if elapsed < frame_time {
+                //println!("Too fast!");
+                thread::sleep(frame_time - elapsed);
+            }
+        }
     }
 }
