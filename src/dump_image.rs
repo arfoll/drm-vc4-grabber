@@ -414,6 +414,22 @@ fn dump_intel_xtiled_xr30_to_image(
     Ok(img)
 }
 
+fn fast_downscale(img: &RgbImage, factor: u32) -> RgbImage {
+    let (w, h) = img.dimensions();
+    let new_w = w / factor;
+    let new_h = h / factor;
+    let mut out = RgbImage::new(new_w, new_h);
+
+    // Sample one pixel per block (very fast)
+    for y in 0..new_h {
+        for x in 0..new_w {
+            let px = img.get_pixel(x * factor, y * factor);
+            out.put_pixel(x, y, *px);
+        }
+    }
+    out
+}
+
 pub fn dump_framebuffer_to_image(
     card: &Card,
     fb: Handle,
@@ -533,11 +549,6 @@ DrmFourcc::Xrgb2101010 => {
     }
 
     let image = image_result?;
-    let scaled = image::imageops::resize(
-        &image,
-        image.width() / 10,
-        image.height() / 10,
-        image::imageops::FilterType::Triangle,
-    );
+    let scaled = fast_downscale(&image, 10);
     Ok(scaled)
 }

@@ -16,6 +16,7 @@ use image::{ImageError, RgbImage};
 
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::{thread, time::Duration};
+use std::time::Instant;
 
 use std::io::Result as StdResult;
 
@@ -189,13 +190,20 @@ fn main() {
         send_color_red(&mut socket, verbose).unwrap();
         thread::sleep(Duration::from_secs(1));
 
-        loop {
-            if let Some(fb) = find_framebuffer(&card, verbose) {
-                dump_and_send_framebuffer(&mut socket, &card, fb, verbose).unwrap();
-                thread::sleep(Duration::from_millis(1000/20));
-            } else {
-                thread::sleep(Duration::from_secs(1));
-            }
-        }
+        let target_fps = 10.0;
+
+let frame_time = Duration::from_secs_f64(1.0 / target_fps);
+loop {
+    let start = Instant::now();
+    if let Some(fb) = find_framebuffer(&card, verbose) {
+        dump_and_send_framebuffer(&mut socket, &card, fb, verbose).unwrap();
+    }
+    let elapsed = start.elapsed();
+    if elapsed < frame_time {
+        println!("Too fast!");
+        thread::sleep(frame_time - elapsed);
+    }
+}
+
     }
 }
