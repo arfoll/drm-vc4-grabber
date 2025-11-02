@@ -414,20 +414,73 @@ fn dump_intel_xtiled_xr30_to_image(
     Ok(img)
 }
 
-fn fast_downscale(img: &RgbImage, factor: u32) -> RgbImage {
-    let (w, h) = img.dimensions();
-    let new_w = w / factor;
-    let new_h = h / factor;
-    let mut out = RgbImage::new(new_w, new_h);
+use rayon::prelude::*;
+use std::ptr;
 
-    // Sample one pixel per block (very fast)
-    for y in 0..new_h {
-        for x in 0..new_w {
-            let px = img.get_pixel(x * factor, y * factor);
-            out.put_pixel(x, y, *px);
-        }
+pub fn fast_downscale(image: &RgbImage, factor: u32) -> RgbImage {
+    let (w, h) = image.dimensions();
+    assert!(factor >= 2, "factor must be >= 2");
+    assert!(w % factor == 0 && h % factor == 0, "factor must divide dimensions");
+
+    let src_w = w as usize;
+    let src_h = h as usize;
+    let f = factor as usize;
+
+    let dst_w = src_w / f;
+    let dst_h = src_h / f;
+
+    let src = image.as_raw();
+    let mut dst = vec![0u8; dst_w * dst_h * 3];
+
+    // Precompute X indices
+    let mut x_index = Vec::with_capacity(dst_w);
+    for dx in 0..dst_w {
+        x_index.push((dx * f) * 3);
     }
-    out
+
+    // Make dst_rows mutable so we can use par_iter_mut
+    let mut dst_rows: Vec<_> = dst
+        .chunks_exact_mut(dst_w * 3)
+        .collect();
+
+    dst_rows.par_iter_mut().enumerate().for_each(|(dy, row)| {
+        let sy = dy * f;
+        let src_row_off = sy * src_w * 3;
+
+        let mut dx = 0;
+        while dx + 4 <= dst_w {
+            unsafe {
+                let s0 = src.as_ptr().add(src_row_off + x_index[dx + 0]);
+                let s1 = src.as_ptr().add(src_row_off + x_index[dx + 1]);
+                let s2 = src.as_ptr().add(src_row_off + x_index[dx + 2]);
+                let s3 = src.as_ptr().add(src_row_off + x_index[dx + 3]);
+
+                let d0 = row.as_mut_ptr().add((dx + 0) * 3);
+                let d1 = row.as_mut_ptr().add((dx + 1) * 3);
+                let d2 = row.as_mut_ptr().add((dx + 2) * 3);
+                let d3 = row.as_mut_ptr().add((dx + 3) * 3);
+
+                ptr::copy_nonoverlapping(s0, d0, 3);
+                ptr::copy_nonoverlapping(s1, d1, 3);
+                ptr::copy_nonoverlapping(s2, d2, 3);
+                ptr::copy_nonoverlapping(s3, d3, 3);
+            }
+            dx += 4;
+        }
+
+        // tail pixels
+        while dx < dst_w {
+            unsafe {
+                let s = src.as_ptr().add(src_row_off + x_index[dx]);
+                let d = row.as_mut_ptr().add(dx * 3);
+                ptr::copy_nonoverlapping(s, d, 3);
+            }
+            dx += 1;
+        }
+    });
+
+    RgbImage::from_raw(dst_w as u32, dst_h as u32, dst)
+        .expect("RGB buffer size mismatch")
 }
 
 pub fn dump_framebuffer_to_image(
