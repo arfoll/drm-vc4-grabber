@@ -482,7 +482,6 @@ DrmFourcc::Xrgb2101010 => {
         )
     }
 }
-
         DrmFourcc::Argb2101010 => {
             dump_linear_xr30_to_image(
                 card,
@@ -534,6 +533,11 @@ DrmFourcc::Xrgb2101010 => {
     }
 
     let image = image_result?;
-
-    Ok(image)
+    let scaled = image::imageops::resize(
+        &image,
+        image.width() / 10,
+        image.height() / 10,
+        image::imageops::FilterType::Triangle,
+    );
+    Ok(scaled)
 }
