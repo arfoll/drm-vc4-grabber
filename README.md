@@ -33,6 +33,10 @@ directly uploads the images.
 5. Compile: `cargo build --release --target aarch64-unknown-linux-gnu`
 6. The built file will be at `target/aarch64-unknown-linux-gnu/release/drm-v4-capture`
 
+## Compiling for J4005
+1. RUSTFLAGS="-C target-cpu=native -C opt-level=3" cargo build --release
+2. Seems to run stable at ~10fps at ~30% CPU load with a 4K/HDR stream
+
 ## Example
 
 The following is an example screen capture in the current codes state.
