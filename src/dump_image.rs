@@ -16,6 +16,88 @@ use crate::{
     Card,
 };
 
+use std::os::fd::RawFd;
+use nix::sys::mman::{ProtFlags, MapFlags};
+use once_cell::sync::OnceCell;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+// SAFETY: PersistentMap contains only an FD and a read-only mmap pointer.
+// We never mutate the mapped memory, and DRM guarantees it remains valid
+// while the handle is alive, so it is safe to share references between threads.
+unsafe impl Send for PersistentMap {}
+unsafe impl Sync for PersistentMap {}
+
+/// Global cache of persistent DRM mappings per framebuffer handle
+static PERSISTENT_MAPS: OnceCell<Mutex<HashMap<u32, PersistentMap>>> = OnceCell::new();
+
+fn get_persistent_map(
+    card: &Card,
+    handle: u32,
+    length_words: usize,
+    verbose: bool,
+) -> Result<&'static PersistentMap, SystemError> {
+    let maps = PERSISTENT_MAPS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut lock = maps.lock().unwrap();
+
+    if !lock.contains_key(&handle) {
+        let map = PersistentMap::new(card, handle, length_words, verbose)?;
+        lock.insert(handle, map);
+    }
+
+    // SAFETY: OnceCell + Mutex ensures stable address
+    let map_ref: *const PersistentMap = lock.get(&handle).unwrap();
+    unsafe { Ok(&*map_ref) }
+}
+
+
+/// Persistent memory map for a DRM framebuffer (u32 pixels)
+pub struct PersistentMap {
+    pub fd: RawFd,
+    pub ptr: *const u32,
+    pub length_words: usize,
+}
+
+impl PersistentMap {
+    pub fn new(card: &Card, handle: u32, length_words: usize, verbose: bool) -> Result<Self, SystemError> {
+        let fd = ffi::prime_handle_to_fd(card.as_raw_fd(), handle)?;
+        let length_bytes = length_words * std::mem::size_of::<u32>();
+
+        if verbose {
+            println!("PersistentMap: mapping handle {} ({} words)", handle, length_words);
+        }
+
+        let addr = std::ptr::null_mut();
+        let prot = ProtFlags::PROT_READ;
+        let flags = MapFlags::MAP_SHARED;
+        let map = unsafe {
+            mman::mmap(addr, length_bytes, prot, flags, fd, 0)
+                .map_err(|_| SystemError::Unknown { errno: nix::errno::Errno::ENOMEM })?
+        } as *const u32;
+
+        Ok(Self {
+            fd,
+            ptr: map,
+            length_words,
+        })
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u32] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.length_words) }
+    }
+}
+
+impl Drop for PersistentMap {
+    fn drop(&mut self) {
+        let length_bytes = self.length_words * std::mem::size_of::<u32>();
+        unsafe {
+            let _ = mman::munmap(self.ptr as *mut _, length_bytes);
+            libc::close(self.fd);
+        }
+    }
+}
+
 fn copy_buffer<T: Sized + Copy>(
     card: &Card,
     handle: u32,
@@ -354,58 +436,103 @@ fn dump_yuv420_to_image(
     }
 }
 
-fn dump_intel_xtiled_xr30_to_image(
+/// Fused untile + decimate (nearest) for Intel X-tiled XR30.
+/// - Input: XR30 (10-bit per channel packed into 32bpp words), Intel X-tiling modifier ((1<<56)|1)
+/// - Output: RgbImage downscaled by integer `decim` (e.g. 6 → 3840x2160 → 640x360)
+fn dump_intel_xtiled_xr30_decimated_to_image(
     card: &Card,
     pitch: u32,
     size: (u32, u32),
     handle: u32,
+    decim: usize,
     verbose: bool,
-) -> Result<RgbImage, SystemError> {
-    // Intel X-tiled 32bpp: 128×8 pixels per tile = 4096 bytes
+) -> Result<image::RgbImage, SystemError> {
+    // Intel X-tiled 32bpp: 128×8 pixels per tile = 4096 bytes (1024 u32 words)
     const TILE_W: usize = 128;
     const TILE_H: usize = 8;
-    const TILE_BYTES: usize = 4096;
+    const TILE_WORDS: usize = TILE_W * TILE_H; // 1024 u32 per tile row-block
 
     let width  = size.0 as usize;
     let height = size.1 as usize;
-    let pitch_words = pitch as usize / 4;
+
+    assert!(decim >= 2, "decim must be >=2");
+    assert!(width % decim == 0 && height % decim == 0, "decim must divide dimensions");
+
+    let dst_w = width / decim;
+    let dst_h = height / decim;
+
+    let pitch_words = pitch as usize / 4;          // 32bpp → words per scanline
+    let tiles_x = (width  + TILE_W - 1) / TILE_W;  // full tiles across
+    let tiles_y = (height + TILE_H - 1) / TILE_H;  // full tiles down
+    let tiles_per_pitch = pitch as usize / (TILE_W * 4); // tiles per scanline in memory
+
+    // Persistent map for the whole framebuffer (u32 view)
+    let length_words = pitch_words * height;
+    let map = get_persistent_map(card, handle, length_words, verbose)?;
+    let src: &[u32] = map.as_slice();
 
     if verbose {
         println!(
-            "intel x-tiled XR30 (final), size={:?}, pitch={}, pitch_words={}",
-            size, pitch, pitch_words
+            "intel x-tiled XR30 (fused decimate), src={:?}, pitch_words={}, tiles=({}x{}), decim={}",
+            size, pitch_words, tiles_x, tiles_y, decim
         );
     }
 
-    let mut copy = vec![0u32; pitch_words * height];
-    copy_buffer(card, handle, &mut copy, verbose)?;
-    let mut img = RgbImage::new(size.0, size.1);
+    // Destination image (RGB888)
+    let mut img = image::RgbImage::new(dst_w as u32, dst_h as u32);
+    let dst_buf = img.as_mut(); // &mut [u8]
 
-    let tiles_x = (width + TILE_W - 1) / TILE_W;
-    let tiles_y = (height + TILE_H - 1) / TILE_H;
-    let tiles_per_pitch = pitch as usize / (TILE_W * 4);
-
+    // Walk tiles; only touch rows/cols that land on decim grid
     for ty in 0..tiles_y {
-        for tx in 0..tiles_x {
-            let tile_base = (ty * tiles_per_pitch + tx) * (TILE_BYTES / 4);
+        let tile_y0 = ty * TILE_H;
+        // For each row inside the tile
+        for y in 0..TILE_H {
+            let src_y = tile_y0 + y;
+            if src_y >= height { break; }
 
-            for y in 0..TILE_H {
-                let dst_y = ty * TILE_H + y;
-                if dst_y >= height { break; }
+            // Only keep every `decim`-th row
+            if src_y % decim != 0 { continue; }
+            let dst_y = src_y / decim;
 
-                let dst_x = tx * TILE_W;
-                let src_start = tile_base + y * (TILE_W);
-                let src_end = (src_start + TILE_W).min(copy.len());
-                if src_start >= copy.len() { break; }
+            for tx in 0..tiles_x {
+                let tile_x0 = tx * TILE_W;
 
-                for (i, &px) in copy[src_start..src_end].iter().enumerate() {
-                    if dst_x + i >= width { break; }
-                    let (r8, g8, b8) = ten_to_eight(px);
-                    img.put_pixel(
-                        (dst_x + i) as u32,
-                        dst_y as u32,
-                        image::Rgb([r8 as u8, g8 as u8, b8 as u8]),
-                    );
+                // Base index of this tile in the linear (tiled) buffer
+                // Each tile row-block is TILE_WORDS words; tiles laid out left→right along pitch
+                let tile_base = (ty * tiles_per_pitch + tx) * TILE_WORDS;
+                let src_row_start = tile_base + y * TILE_W;
+
+                // For each column inside the tile, step by decim
+                // Clamp the last tile to the actual width
+                let run = TILE_W.min(width.saturating_sub(tile_x0));
+                let mut x = 0usize;
+                while x < run {
+                    let src_x = tile_x0 + x;
+                    if src_x % decim == 0 {
+                        let dst_x = src_x / decim;
+
+                        // Fetch XR30 pixel (u32), convert 10→8
+                        let px10 = unsafe { *src.get_unchecked(src_row_start + x) };
+                        let (r8, g8, b8) = ten_to_eight(px10);
+
+                        // Write RGB directly into dst buffer
+                        let di = (dst_y * dst_w + dst_x) * 3;
+                        unsafe {
+                            // bounds guaranteed by construction
+                            *dst_buf.get_unchecked_mut(di + 0) = r8 as u8;
+                            *dst_buf.get_unchecked_mut(di + 1) = g8 as u8;
+                            *dst_buf.get_unchecked_mut(di + 2) = b8 as u8;
+                        }
+                    }
+                    // Jump to next candidate on decim grid within the tile
+                    // (advance by 1 until aligned, then by decim)
+                    if (src_x + 1) % decim == 0 {
+                        x += 1;                 // step onto alignment
+                    } else {
+                        // compute delta to next multiple of decim within the tile band
+                        let next = decim - ((src_x + 1) % decim);
+                        x += 1 + next;
+                    }
                 }
             }
         }
@@ -540,17 +667,19 @@ pub fn dump_framebuffer_to_image(
             ),
             _ => panic!("Unsupported framebuffer modifier: {:?}", modifier),
         },
-DrmFourcc::Xrgb2101010 => {
-    if fbinfo2.modifier[0] == ((1u64 << 56) | 1) {
-        dump_intel_xtiled_xr30_to_image(
-            card, fbinfo2.pitches[0], size, fbinfo2.handles[0], verbose,
-        )
-    } else {
-        dump_linear_xr30_to_image(
-            card, fbinfo2.pitches[0], size, 32, fbinfo2.handles[0], verbose,
-        )
-    }
-}
+        DrmFourcc::Xrgb2101010 => {
+        if fbinfo2.modifier[0] == ((1u64 << 56) | 1) {
+            // Choose your integer factor. 6 → 640x360 from 3840x2160.
+            let decim = 6usize;
+                dump_intel_xtiled_xr30_decimated_to_image(
+                  card, fbinfo2.pitches[0], size, fbinfo2.handles[0], decim, verbose,
+                )
+            } else {
+                dump_linear_xr30_to_image(
+                    card, fbinfo2.pitches[0], size, 32, fbinfo2.handles[0], verbose,
+                )
+            }
+        }
         DrmFourcc::Argb2101010 => {
             dump_linear_xr30_to_image(
                 card,
@@ -602,6 +731,5 @@ DrmFourcc::Xrgb2101010 => {
     }
 
     let image = image_result?;
-    let scaled = fast_downscale(&image, 10);
-    Ok(scaled)
+    Ok(image)
 }
