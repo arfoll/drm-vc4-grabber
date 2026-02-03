@@ -148,12 +148,11 @@ fn decimate_image_4(size: (usize, usize), image: &[u32], copy: &mut [u32]) {
 /// Output (LE memory): u32 with bytes [BB, GG, RR, 00]
 #[inline]
 fn ten_to_eight(v10: u32) -> (u32, u32, u32) {
-    // Scale 10->8 with rounding: (x*255 + 511)/1023
-    let scale = |x: u32| ((x * 255 + 511) / 1023) & 0xFF;
-    let r10 = (v10 >> 20) & 0x3FF;
-    let g10 = (v10 >> 10) & 0x3FF;
-    let b10 = (v10 >>  0) & 0x3FF;
-    (scale(r10), scale(g10), scale(b10))
+    // Fast 10->8 bit conversion: just shift right by 2 (drops lowest 2 bits)
+    let r8 = (v10 >> 22) & 0xFF;
+    let g8 = (v10 >> 12) & 0xFF;
+    let b8 = (v10 >>  2) & 0xFF;
+    (r8, g8, b8)
 }
 
 fn xr30_to_xr24_inplace(pixels: &mut [u32]) {
