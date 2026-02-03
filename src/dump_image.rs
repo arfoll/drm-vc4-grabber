@@ -543,6 +543,26 @@ fn dump_intel_xtiled_xr30_decimated_to_image(
 use rayon::prelude::*;
 use std::ptr;
 
+/// Mask subtitle region by copying colors from above.
+/// Keeps corners intact, only affects the center-bottom area where subtitles appear.
+/// - `bottom_frac`: fraction of height for subtitle zone (e.g., 0.12 = bottom 12%)
+/// - `corner_frac`: fraction of width to preserve on each side (e.g., 0.15 = outer 15% each side)
+pub fn mask_subtitles(img: &mut RgbImage, bottom_frac: f32, corner_frac: f32) {
+    let (w, h) = img.dimensions();
+    let sub_top = ((1.0 - bottom_frac) * h as f32) as u32;
+    let left_edge = (corner_frac * w as f32) as u32;
+    let right_edge = ((1.0 - corner_frac) * w as f32) as u32;
+
+    // For each row in the subtitle zone, copy from the row just above the zone
+    let src_y = sub_top.saturating_sub(1);
+    for y in sub_top..h {
+        for x in left_edge..right_edge {
+            let px = *img.get_pixel(x, src_y);
+            img.put_pixel(x, y, px);
+        }
+    }
+}
+
 pub fn fast_downscale(image: &RgbImage, factor: u32) -> RgbImage {
     let (w, h) = image.dimensions();
     assert!(factor >= 2, "factor must be >= 2");
@@ -613,6 +633,7 @@ pub fn dump_framebuffer_to_image(
     card: &Card,
     fb: Handle,
     verbose: bool,
+    mask_subs: bool,
 ) -> Result<RgbImage, SystemError> {
     let fbinfo2 = ffi::fb_cmd2(card.as_raw_fd(), fb.into())?;
 
@@ -729,6 +750,9 @@ pub fn dump_framebuffer_to_image(
         }
     }
 
-    let image = image_result?;
+    let mut image = image_result?;
+    if mask_subs {
+        mask_subtitles(&mut image, 0.20, 0.15);
+    }
     Ok(image)
 }

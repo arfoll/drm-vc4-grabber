@@ -76,8 +76,9 @@ fn dump_and_send_framebuffer(
     card: &Card,
     fb: Handle,
     verbose: bool,
+    mask_subs: bool,
 ) -> StdResult<()> {
-    let img = dump_framebuffer_to_image(card, fb, verbose);
+    let img = dump_framebuffer_to_image(card, fb, verbose, mask_subs);
     if let Ok(img) = img {
         send_dumped_image(socket, &img, verbose)?;
     } else {
@@ -156,10 +157,17 @@ fn main() {
                 .long("verbose")
                 .help("Print verbose debugging information."),
         )
+        .arg(
+            Arg::with_name("mask-subtitles")
+                .short("m")
+                .long("mask-subtitles")
+                .help("Mask the subtitle region (bottom center) to avoid color flicker."),
+        )
         .get_matches();
 
     let verbose = matches.is_present("verbose");
     let screenshot = matches.is_present("screenshot");
+    let mask_subs = matches.is_present("mask-subtitles");
     let device_path = matches.value_of("device").unwrap();
     let card = Card::open(device_path);
     let authenticated = card.authenticated().unwrap();
@@ -177,7 +185,7 @@ fn main() {
     let adress = matches.value_of("address").unwrap();
     if screenshot {
         if let Some(fb) = find_framebuffer(&card, verbose) {
-            let img = dump_framebuffer_to_image(&card, fb, verbose).unwrap();
+            let img = dump_framebuffer_to_image(&card, fb, verbose, mask_subs).unwrap();
             save_screenshot(&img).unwrap();
         } else {
             println!("No framebuffer found!");
@@ -196,7 +204,7 @@ fn main() {
         loop {
             let start = Instant::now();
             if let Some(fb) = find_framebuffer(&card, verbose) {
-                dump_and_send_framebuffer(&mut socket, &card, fb, verbose).unwrap();
+                dump_and_send_framebuffer(&mut socket, &card, fb, verbose, mask_subs).unwrap();
             }
             let elapsed = start.elapsed();
             if elapsed < frame_time {
