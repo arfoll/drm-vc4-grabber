@@ -11,7 +11,7 @@ use drm::control::{Device as ControlDevice, connector};
 use drm::Device;
 use drm_ffi::drm_set_client_cap;
 
-use dump_image::{dump_framebuffer_to_image, set_hdr_pq_mode};
+use dump_image::{dump_framebuffer_to_image, set_hdr_pq_mode, set_luminance_hdr, set_luminance_sdr, set_saturation_hdr};
 use image::{ImageError, RgbImage};
 
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -123,22 +123,33 @@ fn detect_hdr_mode(card: &Card, verbose: bool) -> bool {
             let name = prop_info.name().to_str().unwrap_or("");
 
             if name == "Colorspace" {
+                if verbose {
+                    println!("Colorspace={}", value);
+                }
                 // BT2020_CYCC=8, BT2020_RGB=9, BT2020_YCC=10
                 if value >= 8 && value <= 10 {
                     if verbose {
-                        println!("HDR detected: Colorspace={} (BT2020)", value);
+                        println!("HDR detected: Colorspace is BT2020");
                     }
                     return true;
                 }
             }
 
             if name == "HDR_OUTPUT_METADATA" {
+                if verbose {
+                    println!("HDR_OUTPUT_METADATA blob_id={}", value);
+                }
                 // Non-zero blob ID means HDR metadata is set
+                // But we need to verify the blob actually has data
                 if value != 0 {
-                    if verbose {
-                        println!("HDR detected: HDR_OUTPUT_METADATA blob={}", value);
+                    if let Ok(blob_data) = card.get_property_blob(value) {
+                        if !blob_data.is_empty() {
+                            if verbose {
+                                println!("HDR detected: HDR_OUTPUT_METADATA has {} bytes", blob_data.len());
+                            }
+                            return true;
+                        }
                     }
-                    return true;
                 }
             }
         }
@@ -232,6 +243,28 @@ fn main() {
                 .long("no-hdr")
                 .help("Disable HDR tone mapping (use simple power curve)."),
         )
+        .arg(
+            Arg::with_name("luminance-hdr")
+                .long("luminance-hdr")
+                .takes_value(true)
+                .default_value("1.0")
+                .help("Luminance multiplier for HDR content (default 1.0)."),
+        )
+        .arg(
+            Arg::with_name("luminance-sdr")
+                .long("luminance-sdr")
+                .takes_value(true)
+                .default_value("1.0")
+                .help("Luminance multiplier for SDR 10-bit content (default 1.0)."),
+        )
+        .arg(
+            Arg::with_name("saturation")
+                .short("s")
+                .long("saturation")
+                .takes_value(true)
+                .default_value("1.3")
+                .help("Saturation boost for HDR content (default 1.3, compensates for BT.2020 gamut)."),
+        )
         .get_matches();
 
     let verbose = matches.is_present("verbose");
@@ -239,6 +272,13 @@ fn main() {
     let mask_subs = matches.is_present("mask-subtitles");
     let force_hdr_pq = matches.is_present("hdr-pq");
     let no_hdr = matches.is_present("no-hdr");
+
+    let lum_hdr: f32 = matches.value_of("luminance-hdr").unwrap().parse().expect("Invalid luminance-hdr value");
+    let lum_sdr: f32 = matches.value_of("luminance-sdr").unwrap().parse().expect("Invalid luminance-sdr value");
+    let sat_hdr: f32 = matches.value_of("saturation").unwrap().parse().expect("Invalid saturation value");
+    set_luminance_hdr(lum_hdr);
+    set_luminance_sdr(lum_sdr);
+    set_saturation_hdr(sat_hdr);
     let device_path = matches.value_of("device").unwrap();
     let card = Card::open(device_path);
     let authenticated = card.authenticated().unwrap();
@@ -263,8 +303,17 @@ fn main() {
     };
 
     // Helper to update HDR mode per-frame
-    let update_hdr_mode = |card: &Card, verbose: bool| {
+    let mut last_hdr_mode: Option<bool> = None;
+    let mut update_hdr_mode = |card: &Card, verbose: bool| {
         let hdr = hdr_override.unwrap_or_else(|| detect_hdr_mode(card, verbose));
+        if last_hdr_mode != Some(hdr) {
+            if hdr {
+                println!(">>> HDR detected - using PQ tone mapping (luminance={}, saturation={})", lum_hdr, sat_hdr);
+            } else {
+                println!(">>> SDR mode - using power curve (luminance={})", lum_sdr);
+            }
+            last_hdr_mode = Some(hdr);
+        }
         set_hdr_pq_mode(hdr);
     };
 

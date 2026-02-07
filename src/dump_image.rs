@@ -26,9 +26,30 @@ use std::sync::Mutex;
 /// Global flag for proper PQ (ST.2084) HDR tone mapping
 static HDR_PQ_MODE: AtomicBool = AtomicBool::new(false);
 
-/// Enable proper PQ HDR tone mapping (call once at startup)
+/// Luminance multipliers for HDR and SDR modes (stored as f32 bits)
+static LUMINANCE_HDR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f800000); // 1.0
+static LUMINANCE_SDR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f800000); // 1.0
+/// Saturation boost for HDR content (stored as f32 bits)
+static SATURATION_HDR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f800000); // 1.0
+
+/// Enable proper PQ HDR tone mapping
 pub fn set_hdr_pq_mode(enabled: bool) {
     HDR_PQ_MODE.store(enabled, Ordering::Relaxed);
+}
+
+/// Set luminance multiplier for HDR content (default 1.0)
+pub fn set_luminance_hdr(value: f32) {
+    LUMINANCE_HDR.store(value.to_bits(), Ordering::Relaxed);
+}
+
+/// Set luminance multiplier for SDR content (default 1.0)
+pub fn set_luminance_sdr(value: f32) {
+    LUMINANCE_SDR.store(value.to_bits(), Ordering::Relaxed);
+}
+
+/// Set saturation boost for HDR content (default 1.0, try 1.2-1.5)
+pub fn set_saturation_hdr(value: f32) {
+    SATURATION_HDR.store(value.to_bits(), Ordering::Relaxed);
 }
 
 // SAFETY: PersistentMap contains only an FD and a read-only mmap pointer.
@@ -182,6 +203,9 @@ fn ten_to_eight(v10: u32) -> (u32, u32, u32) {
     let b10 = (v10 & 0x3FF) as f32 / 1023.0;
 
     if HDR_PQ_MODE.load(Ordering::Relaxed) {
+        let lum = f32::from_bits(LUMINANCE_HDR.load(Ordering::Relaxed));
+        let sat = f32::from_bits(SATURATION_HDR.load(Ordering::Relaxed));
+
         // Proper PQ decode + tone mapping
         let r_lin = pq_eotf(r10);
         let g_lin = pq_eotf(g10);
@@ -194,17 +218,30 @@ fn ten_to_eight(v10: u32) -> (u32, u32, u32) {
         // Apply tone mapping and gamma encode to sRGB
         let gamma = |x: f32| x.powf(1.0 / 2.2);
 
-        let r8 = (gamma(tonemap(r_lin)) * 255.0).min(255.0) as u32;
-        let g8 = (gamma(tonemap(g_lin)) * 255.0).min(255.0) as u32;
-        let b8 = (gamma(tonemap(b_lin)) * 255.0).min(255.0) as u32;
+        let mut r = gamma(tonemap(r_lin));
+        let mut g = gamma(tonemap(g_lin));
+        let mut b = gamma(tonemap(b_lin));
+
+        // Boost saturation to compensate for BT.2020 -> BT.709 gamut loss
+        let avg = (r + g + b) / 3.0;
+        r = avg + (r - avg) * sat;
+        g = avg + (g - avg) * sat;
+        b = avg + (b - avg) * sat;
+
+        // Apply luminance and convert to 8-bit
+        let r8 = (r * lum * 255.0).clamp(0.0, 255.0) as u32;
+        let g8 = (g * lum * 255.0).clamp(0.0, 255.0) as u32;
+        let b8 = (b * lum * 255.0).clamp(0.0, 255.0) as u32;
 
         (r8, g8, b8)
     } else {
+        let lum = f32::from_bits(LUMINANCE_SDR.load(Ordering::Relaxed));
+
         // Simple power curve (faster, good enough for most content)
         const GAMMA: f32 = 0.55;
-        let r8 = (r10.powf(GAMMA) * 255.0) as u32;
-        let g8 = (g10.powf(GAMMA) * 255.0) as u32;
-        let b8 = (b10.powf(GAMMA) * 255.0) as u32;
+        let r8 = (r10.powf(GAMMA) * lum * 255.0).clamp(0.0, 255.0) as u32;
+        let g8 = (g10.powf(GAMMA) * lum * 255.0).clamp(0.0, 255.0) as u32;
+        let b8 = (b10.powf(GAMMA) * lum * 255.0).clamp(0.0, 255.0) as u32;
 
         (r8, g8, b8)
     }
