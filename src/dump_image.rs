@@ -1,4 +1,5 @@
 use std::{convert::TryFrom, mem::size_of, os::fd::AsRawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use drm::control::framebuffer::Handle;
 use drm::SystemError;
@@ -21,6 +22,14 @@ use nix::sys::mman::{ProtFlags, MapFlags};
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+/// Global flag for proper PQ (ST.2084) HDR tone mapping
+static HDR_PQ_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Enable proper PQ HDR tone mapping (call once at startup)
+pub fn set_hdr_pq_mode(enabled: bool) {
+    HDR_PQ_MODE.store(enabled, Ordering::Relaxed);
+}
 
 // SAFETY: PersistentMap contains only an FD and a read-only mmap pointer.
 // We never mutate the mapped memory, and DRM guarantees it remains valid
@@ -143,16 +152,62 @@ fn decimate_image_4(size: (usize, usize), image: &[u32], copy: &mut [u32]) {
     }
 }
 
+/// ST.2084 PQ EOTF: decode PQ-encoded value to linear light (0-1 normalized)
+#[inline]
+fn pq_eotf(v: f32) -> f32 {
+    const M1: f32 = 0.1593017578125;
+    const M2: f32 = 78.84375;
+    const C1: f32 = 0.8359375;
+    const C2: f32 = 18.8515625;
+    const C3: f32 = 18.6875;
+
+    let vp = v.powf(1.0 / M2);
+    let num = (vp - C1).max(0.0);
+    let den = C2 - C3 * vp;
+    (num / den).powf(1.0 / M1)
+}
+
 /// Convert in-place from XRGB2101010/ARGB2101010 to XRGB8888 order.
 /// Input: 0b XX RRRRRRRRRR GGGGGGGGGG BBBBBBBBBB (bits: 31..0)
 /// Output (LE memory): u32 with bytes [BB, GG, RR, 00]
+///
+/// Two modes:
+/// - Default: Simple power curve to counteract PQ encoding
+/// - HDR_PQ_MODE: Proper PQ decode + Reinhard tone mapping
 #[inline]
 fn ten_to_eight(v10: u32) -> (u32, u32, u32) {
-    // Fast 10->8 bit conversion: just shift right by 2 (drops lowest 2 bits)
-    let r8 = (v10 >> 22) & 0xFF;
-    let g8 = (v10 >> 12) & 0xFF;
-    let b8 = (v10 >>  2) & 0xFF;
-    (r8, g8, b8)
+    // Extract full 10-bit values
+    let r10 = ((v10 >> 20) & 0x3FF) as f32 / 1023.0;
+    let g10 = ((v10 >> 10) & 0x3FF) as f32 / 1023.0;
+    let b10 = (v10 & 0x3FF) as f32 / 1023.0;
+
+    if HDR_PQ_MODE.load(Ordering::Relaxed) {
+        // Proper PQ decode + tone mapping
+        let r_lin = pq_eotf(r10);
+        let g_lin = pq_eotf(g10);
+        let b_lin = pq_eotf(b10);
+
+        // Reinhard tone mapping with high exposure for punchy LED colors
+        const EXPOSURE: f32 = 10.0;
+        let tonemap = |x: f32| (x * EXPOSURE) / (1.0 + x * EXPOSURE);
+
+        // Apply tone mapping and gamma encode to sRGB
+        let gamma = |x: f32| x.powf(1.0 / 2.2);
+
+        let r8 = (gamma(tonemap(r_lin)) * 255.0).min(255.0) as u32;
+        let g8 = (gamma(tonemap(g_lin)) * 255.0).min(255.0) as u32;
+        let b8 = (gamma(tonemap(b_lin)) * 255.0).min(255.0) as u32;
+
+        (r8, g8, b8)
+    } else {
+        // Simple power curve (faster, good enough for most content)
+        const GAMMA: f32 = 0.55;
+        let r8 = (r10.powf(GAMMA) * 255.0) as u32;
+        let g8 = (g10.powf(GAMMA) * 255.0) as u32;
+        let b8 = (b10.powf(GAMMA) * 255.0) as u32;
+
+        (r8, g8, b8)
+    }
 }
 
 fn xr30_to_xr24_inplace(pixels: &mut [u32]) {

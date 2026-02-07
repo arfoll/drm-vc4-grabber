@@ -7,11 +7,11 @@ use std::os::fd::AsFd;
 
 use clap::{App, Arg};
 use drm::control::framebuffer::Handle;
-use drm::control::Device as ControlDevice;
+use drm::control::{Device as ControlDevice, connector};
 use drm::Device;
 use drm_ffi::drm_set_client_cap;
 
-use dump_image::dump_framebuffer_to_image;
+use dump_image::{dump_framebuffer_to_image, set_hdr_pq_mode};
 use image::{ImageError, RgbImage};
 
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -86,6 +86,65 @@ fn dump_and_send_framebuffer(
     }
 
     Ok(())
+}
+
+/// Check if HDR is active by examining connector properties.
+/// Returns true if Colorspace is BT2020 (values 8-10) or if HDR_OUTPUT_METADATA is set.
+fn detect_hdr_mode(card: &Card, verbose: bool) -> bool {
+    let resource_handles = match card.resource_handles() {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+
+    for conn_handle in resource_handles.connectors() {
+        let conn_info = match card.get_connector(*conn_handle) {
+            Ok(info) => info,
+            Err(_) => continue,
+        };
+
+        // Only check connected connectors
+        if conn_info.state() != connector::State::Connected {
+            continue;
+        }
+
+        // Get properties for this connector
+        let props = match card.get_properties(*conn_handle) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let (handles, values) = props.as_props_and_values();
+        for (prop_handle, &value) in handles.iter().zip(values.iter()) {
+            let prop_info = match card.get_property(*prop_handle) {
+                Ok(info) => info,
+                Err(_) => continue,
+            };
+
+            let name = prop_info.name().to_str().unwrap_or("");
+
+            if name == "Colorspace" {
+                // BT2020_CYCC=8, BT2020_RGB=9, BT2020_YCC=10
+                if value >= 8 && value <= 10 {
+                    if verbose {
+                        println!("HDR detected: Colorspace={} (BT2020)", value);
+                    }
+                    return true;
+                }
+            }
+
+            if name == "HDR_OUTPUT_METADATA" {
+                // Non-zero blob ID means HDR metadata is set
+                if value != 0 {
+                    if verbose {
+                        println!("HDR detected: HDR_OUTPUT_METADATA blob={}", value);
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn find_framebuffer(card: &Card, verbose: bool) -> Option<Handle> {
@@ -163,11 +222,23 @@ fn main() {
                 .long("mask-subtitles")
                 .help("Mask the subtitle region (bottom center) to avoid color flicker."),
         )
+        .arg(
+            Arg::with_name("hdr-pq")
+                .long("hdr-pq")
+                .help("Force PQ HDR tone mapping on (auto-detected by default)."),
+        )
+        .arg(
+            Arg::with_name("no-hdr")
+                .long("no-hdr")
+                .help("Disable HDR tone mapping (use simple power curve)."),
+        )
         .get_matches();
 
     let verbose = matches.is_present("verbose");
     let screenshot = matches.is_present("screenshot");
     let mask_subs = matches.is_present("mask-subtitles");
+    let force_hdr_pq = matches.is_present("hdr-pq");
+    let no_hdr = matches.is_present("no-hdr");
     let device_path = matches.value_of("device").unwrap();
     let card = Card::open(device_path);
     let authenticated = card.authenticated().unwrap();
@@ -182,9 +253,25 @@ fn main() {
         drm_ffi::ioctl::set_cap(card.as_raw_fd(), &set_cap).unwrap();
     }
 
+    // HDR mode override (None = auto-detect per frame)
+    let hdr_override: Option<bool> = if force_hdr_pq {
+        Some(true)
+    } else if no_hdr {
+        Some(false)
+    } else {
+        None
+    };
+
+    // Helper to update HDR mode per-frame
+    let update_hdr_mode = |card: &Card, verbose: bool| {
+        let hdr = hdr_override.unwrap_or_else(|| detect_hdr_mode(card, verbose));
+        set_hdr_pq_mode(hdr);
+    };
+
     let adress = matches.value_of("address").unwrap();
     if screenshot {
         if let Some(fb) = find_framebuffer(&card, verbose) {
+            update_hdr_mode(&card, verbose);
             let img = dump_framebuffer_to_image(&card, fb, verbose, mask_subs).unwrap();
             save_screenshot(&img).unwrap();
         } else {
@@ -203,12 +290,13 @@ fn main() {
         let frame_time = Duration::from_secs_f64(1.0 / target_fps);
         loop {
             let start = Instant::now();
+            // Update HDR mode each frame (auto-detect unless overridden)
+            update_hdr_mode(&card, verbose);
             if let Some(fb) = find_framebuffer(&card, verbose) {
                 dump_and_send_framebuffer(&mut socket, &card, fb, verbose, mask_subs).unwrap();
             }
             let elapsed = start.elapsed();
             if elapsed < frame_time {
-                //println!("Too fast!");
                 thread::sleep(frame_time - elapsed);
             }
         }
