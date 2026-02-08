@@ -37,6 +37,9 @@ directly uploads the images.
 1. RUSTFLAGS="-C target-cpu=native -C opt-level=3" cargo build --release
 2. Seems to run stable at ~10fps at ~30% CPU load with a 4K/HDR stream
 
+## Parameters for running with reasonable colours
+./target/release/drm-vc4-grabber -d /dev/dri/card1 -a localhost:19400 -m --luminance-hdr 2 --saturation 1.5 --luminance-sdr 0.7
+
 ## Example
 
 The following is an example screen capture in the current codes state.

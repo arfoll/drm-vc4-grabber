@@ -128,6 +128,51 @@ impl Drop for PersistentMap {
     }
 }
 
+const NUM_SAMPLES: usize = 32;
+
+/// Quick-sample a framebuffer: mmap, read NUM_SAMPLES evenly-spaced u32 values, munmap.
+/// Used to detect unchanged frames without doing the full decode.
+pub fn sample_framebuffer(
+    card: &Card,
+    fb: Handle,
+) -> Result<[u32; NUM_SAMPLES], SystemError> {
+    let fbinfo2 = ffi::fb_cmd2(card.as_raw_fd(), fb.into())?;
+    let handle = fbinfo2.handles[0];
+    let pitch = fbinfo2.pitches[0] as usize;
+    let height = fbinfo2.height as usize;
+    let total_bytes = pitch * height;
+    let total_words = total_bytes / 4;
+
+    let hfd = ffi::prime_handle_to_fd(card.as_raw_fd(), handle)?;
+    let mut samples = [0u32; NUM_SAMPLES];
+
+    unsafe {
+        let map = mman::mmap(
+            core::ptr::null_mut(),
+            total_bytes,
+            mman::ProtFlags::PROT_READ,
+            mman::MapFlags::MAP_SHARED,
+            hfd,
+            0,
+        )
+        .map_err(|_| SystemError::Unknown {
+            errno: nix::errno::Errno::ENOMEM,
+        })?;
+
+        let slice = std::slice::from_raw_parts(map as *const u32, total_words);
+        let step = total_words / NUM_SAMPLES;
+        for i in 0..NUM_SAMPLES {
+            samples[i] = slice[i * step];
+        }
+
+        let _ = mman::munmap(map, total_bytes);
+        close(hfd);
+    }
+
+    let _ = gem_close(card.as_raw_fd(), handle);
+    Ok(samples)
+}
+
 fn copy_buffer<T: Sized + Copy>(
     card: &Card,
     handle: u32,
@@ -160,13 +205,26 @@ fn copy_buffer<T: Sized + Copy>(
     Ok(())
 }
 
-fn decimate_image_4(size: (usize, usize), image: &[u32], copy: &mut [u32]) {
+fn decimate_image_4(size: (usize, usize), image: &[u32], copy: &mut [u32], border_frac: f32) {
     let decim = (4, 4);
     let newsize = (size.0 / decim.0, size.1 / decim.1);
 
+    let border_active = border_frac > 0.0;
+    let bt = (size.1 as f32 * border_frac) as usize;
+    let bl = (size.0 as f32 * border_frac) as usize;
+    let bb = size.1.saturating_sub(bt);
+    let br = size.0.saturating_sub(bl);
+
     for y in 0..newsize.1 {
         let ty = decim.1 * y;
+        let y_interior = border_active && ty >= bt && ty < bb;
         for x in 0..newsize.0 {
+            if y_interior {
+                let tx = decim.0 * x;
+                if tx >= bl && tx < br {
+                    continue;
+                }
+            }
             let tx = decim.0 * x;
             copy[y * newsize.0 + x] = image[ty * size.0 + tx];
         }
@@ -383,6 +441,7 @@ fn dump_linear_to_image(
     size: (u32, u32),
     bpp: u32,
     handle: u32,
+    border_frac: f32,
     verbose: bool,
 ) -> Result<RgbImage, SystemError> {
     let size = (size.0, size.1);
@@ -401,6 +460,7 @@ fn dump_linear_to_image(
         (size.0 as _, size.1 as _),
         copy.as_slice(),
         dec.as_mut_slice(),
+        border_frac,
     );
 
     Ok(decode_image(
@@ -416,6 +476,7 @@ fn dump_linear_xr30_to_image(
     size: (u32, u32),
     _bpp: u32,
     handle: u32,
+    border_frac: f32,
     verbose: bool,
 ) -> Result<RgbImage, SystemError> {
     // Even though it's 30bpp, DRM buffers are 32-bit words per pixel.
@@ -428,18 +489,41 @@ fn dump_linear_xr30_to_image(
     let mut copy = vec![0u32; length_words as _];
     copy_buffer(card, handle, &mut copy, verbose)?;
 
-    // Convert XR30→XR24 in place
-    xr30_to_xr24_inplace(&mut copy);
+    // Fused XR30→RGB + decimate + border skip in a single pass
+    let width = size.0 as usize;
+    let height = size.1 as usize;
+    let pitch_words = pitch as usize / 4;
+    let decim = 4usize;
+    let dw = width / decim;
+    let dh = height / decim;
 
-    // Decimate to keep CPU work low (like the XR24 path)
-    let mut dec = vec![0u32; (length_words / (4 * 4)) as _];
-    decimate_image_4((size.0 as _, size.1 as _), copy.as_slice(), dec.as_mut_slice());
+    let border_active = border_frac > 0.0;
+    let border_top = (height as f32 * border_frac) as usize;
+    let border_bot = height.saturating_sub(border_top);
+    let border_left = (width as f32 * border_frac) as usize;
+    let border_right = width.saturating_sub(border_left);
 
-    Ok(decode_image(
-        dec.as_mut_slice(),
-        pitch / 4,
-        (size.0 / 4, size.1 / 4),
-    ))
+    let mut img = RgbImage::new(dw as u32, dh as u32);
+    let dst = img.as_mut();
+
+    for dy in 0..dh {
+        let sy = dy * decim;
+        let y_interior = border_active && sy >= border_top && sy < border_bot;
+        for dx in 0..dw {
+            let sx = dx * decim;
+            if y_interior && sx >= border_left && sx < border_right {
+                continue;
+            }
+            let px = copy[sy * pitch_words + sx];
+            let (r8, g8, b8) = ten_to_eight(px);
+            let di = (dy * dw + dx) * 3;
+            dst[di] = r8 as u8;
+            dst[di + 1] = g8 as u8;
+            dst[di + 2] = b8 as u8;
+        }
+    }
+
+    Ok(img)
 }
 
 fn dump_rgb565_to_image(
@@ -536,6 +620,7 @@ fn dump_intel_xtiled_xr30_decimated_to_image(
     size: (u32, u32),
     handle: u32,
     decim: usize,
+    border_frac: f32,
     verbose: bool,
 ) -> Result<image::RgbImage, SystemError> {
     // Intel X-tiled 32bpp: 128×8 pixels per tile = 4096 bytes (1024 u32 words)
@@ -573,6 +658,13 @@ fn dump_intel_xtiled_xr30_decimated_to_image(
     let mut img = image::RgbImage::new(dst_w as u32, dst_h as u32);
     let dst_buf = img.as_mut(); // &mut [u8]
 
+    // Border bounds in source pixel coordinates
+    let border_active = border_frac > 0.0;
+    let border_top = (height as f32 * border_frac) as usize;
+    let border_bot = height.saturating_sub(border_top);
+    let border_left = (width as f32 * border_frac) as usize;
+    let border_right = width.saturating_sub(border_left);
+
     // Walk tiles; only touch rows/cols that land on decim grid
     for ty in 0..tiles_y {
         let tile_y0 = ty * TILE_H;
@@ -585,8 +677,18 @@ fn dump_intel_xtiled_xr30_decimated_to_image(
             if src_y % decim != 0 { continue; }
             let dst_y = src_y / decim;
 
+            let y_in_interior = border_active && src_y >= border_top && src_y < border_bot;
+
             for tx in 0..tiles_x {
                 let tile_x0 = tx * TILE_W;
+
+                // Tile-level skip: entire tile is in the interior
+                if y_in_interior {
+                    let tile_x_end = (tile_x0 + TILE_W).min(width);
+                    if tile_x0 >= border_left && tile_x_end <= border_right {
+                        continue;
+                    }
+                }
 
                 // Base index of this tile in the linear (tiled) buffer
                 // Each tile row-block is TILE_WORDS words; tiles laid out left→right along pitch
@@ -600,19 +702,22 @@ fn dump_intel_xtiled_xr30_decimated_to_image(
                 while x < run {
                     let src_x = tile_x0 + x;
                     if src_x % decim == 0 {
-                        let dst_x = src_x / decim;
+                        // Pixel-level border skip for tiles straddling the border
+                        if !(y_in_interior && src_x >= border_left && src_x < border_right) {
+                            let dst_x = src_x / decim;
 
-                        // Fetch XR30 pixel (u32), convert 10→8
-                        let px10 = unsafe { *src.get_unchecked(src_row_start + x) };
-                        let (r8, g8, b8) = ten_to_eight(px10);
+                            // Fetch XR30 pixel (u32), convert 10→8
+                            let px10 = unsafe { *src.get_unchecked(src_row_start + x) };
+                            let (r8, g8, b8) = ten_to_eight(px10);
 
-                        // Write RGB directly into dst buffer
-                        let di = (dst_y * dst_w + dst_x) * 3;
-                        unsafe {
-                            // bounds guaranteed by construction
-                            *dst_buf.get_unchecked_mut(di + 0) = r8 as u8;
-                            *dst_buf.get_unchecked_mut(di + 1) = g8 as u8;
-                            *dst_buf.get_unchecked_mut(di + 2) = b8 as u8;
+                            // Write RGB directly into dst buffer
+                            let di = (dst_y * dst_w + dst_x) * 3;
+                            unsafe {
+                                // bounds guaranteed by construction
+                                *dst_buf.get_unchecked_mut(di + 0) = r8 as u8;
+                                *dst_buf.get_unchecked_mut(di + 1) = g8 as u8;
+                                *dst_buf.get_unchecked_mut(di + 2) = b8 as u8;
+                            }
                         }
                     }
                     // Jump to next candidate on decim grid within the tile
@@ -726,6 +831,7 @@ pub fn dump_framebuffer_to_image(
     fb: Handle,
     verbose: bool,
     mask_subs: bool,
+    border_frac: f32,
 ) -> Result<RgbImage, SystemError> {
     let fbinfo2 = ffi::fb_cmd2(card.as_raw_fd(), fb.into())?;
 
@@ -761,6 +867,7 @@ pub fn dump_framebuffer_to_image(
                 size,
                 32,
                 fbinfo2.handles[0],
+                border_frac,
                 verbose,
             ),
             _ => panic!("Unsupported framebuffer modifier: {:?}", modifier),
@@ -775,6 +882,7 @@ pub fn dump_framebuffer_to_image(
                 size,
                 32,
                 fbinfo2.handles[0],
+                border_frac,
                 verbose,
             ),
             _ => panic!("Unsupported framebuffer modifier: {:?}", modifier),
@@ -784,11 +892,11 @@ pub fn dump_framebuffer_to_image(
             // Choose your integer factor. 6 → 640x360 from 3840x2160.
             let decim = 6usize;
                 dump_intel_xtiled_xr30_decimated_to_image(
-                  card, fbinfo2.pitches[0], size, fbinfo2.handles[0], decim, verbose,
+                  card, fbinfo2.pitches[0], size, fbinfo2.handles[0], decim, border_frac, verbose,
                 )
             } else {
                 dump_linear_xr30_to_image(
-                    card, fbinfo2.pitches[0], size, 32, fbinfo2.handles[0], verbose,
+                    card, fbinfo2.pitches[0], size, 32, fbinfo2.handles[0], border_frac, verbose,
                 )
             }
         }
@@ -799,6 +907,7 @@ pub fn dump_framebuffer_to_image(
                 size,
                 32,
                 fbinfo2.handles[0],
+                border_frac,
                 verbose,
             )
         },

@@ -11,7 +11,7 @@ use drm::control::{Device as ControlDevice, connector};
 use drm::Device;
 use drm_ffi::drm_set_client_cap;
 
-use dump_image::{dump_framebuffer_to_image, set_hdr_pq_mode, set_luminance_hdr, set_luminance_sdr, set_saturation_hdr};
+use dump_image::{dump_framebuffer_to_image, sample_framebuffer, set_hdr_pq_mode, set_luminance_hdr, set_luminance_sdr, set_saturation_hdr};
 use image::{ImageError, RgbImage};
 
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -77,8 +77,9 @@ fn dump_and_send_framebuffer(
     fb: Handle,
     verbose: bool,
     mask_subs: bool,
+    border_frac: f32,
 ) -> StdResult<()> {
-    let img = dump_framebuffer_to_image(card, fb, verbose, mask_subs);
+    let img = dump_framebuffer_to_image(card, fb, verbose, mask_subs, border_frac);
     if let Ok(img) = img {
         send_dumped_image(socket, &img, verbose)?;
     } else {
@@ -265,6 +266,19 @@ fn main() {
                 .default_value("1.3")
                 .help("Saturation boost for HDR content (default 1.3, compensates for BT.2020 gamut)."),
         )
+        .arg(
+            Arg::with_name("border")
+                .short("b")
+                .long("border")
+                .takes_value(true)
+                .default_value("0")
+                .help("Edge-only capture: fraction of each edge to process (e.g. 0.2 = outer 20%). Skips interior pixels to reduce CPU. Use >= 0.15 to clear black bars."),
+        )
+        .arg(
+            Arg::with_name("skip-unchanged")
+                .long("skip-unchanged")
+                .help("Skip frames that haven't changed (samples 32 pixels to detect changes)."),
+        )
         .get_matches();
 
     let verbose = matches.is_present("verbose");
@@ -272,10 +286,12 @@ fn main() {
     let mask_subs = matches.is_present("mask-subtitles");
     let force_hdr_pq = matches.is_present("hdr-pq");
     let no_hdr = matches.is_present("no-hdr");
+    let skip_unchanged = matches.is_present("skip-unchanged");
 
     let lum_hdr: f32 = matches.value_of("luminance-hdr").unwrap().parse().expect("Invalid luminance-hdr value");
     let lum_sdr: f32 = matches.value_of("luminance-sdr").unwrap().parse().expect("Invalid luminance-sdr value");
     let sat_hdr: f32 = matches.value_of("saturation").unwrap().parse().expect("Invalid saturation value");
+    let border_frac: f32 = matches.value_of("border").unwrap().parse().expect("Invalid border value");
     set_luminance_hdr(lum_hdr);
     set_luminance_sdr(lum_sdr);
     set_saturation_hdr(sat_hdr);
@@ -321,7 +337,7 @@ fn main() {
     if screenshot {
         if let Some(fb) = find_framebuffer(&card, verbose) {
             update_hdr_mode(&card, verbose);
-            let img = dump_framebuffer_to_image(&card, fb, verbose, mask_subs).unwrap();
+            let img = dump_framebuffer_to_image(&card, fb, verbose, mask_subs, border_frac).unwrap();
             save_screenshot(&img).unwrap();
         } else {
             println!("No framebuffer found!");
@@ -337,12 +353,37 @@ fn main() {
         let target_fps = 10.0;
 
         let frame_time = Duration::from_secs_f64(1.0 / target_fps);
+        let mut prev_samples = [0u32; 32];
+        let mut prev_image: Option<RgbImage> = None;
+        let mut skipped = 0u32;
         loop {
             let start = Instant::now();
             // Update HDR mode each frame (auto-detect unless overridden)
             update_hdr_mode(&card, verbose);
             if let Some(fb) = find_framebuffer(&card, verbose) {
-                dump_and_send_framebuffer(&mut socket, &card, fb, verbose, mask_subs).unwrap();
+                // Quick-sample to detect unchanged frames
+                if skip_unchanged {
+                    if let Ok(samples) = sample_framebuffer(&card, fb) {
+                        if samples == prev_samples {
+                            skipped += 1;
+                            if verbose {
+                                println!("Frame unchanged, resending previous ({})", skipped);
+                            }
+                            if let Some(ref img) = prev_image {
+                                let _ = send_dumped_image(&mut socket, img, verbose);
+                            }
+                        } else {
+                            prev_samples = samples;
+                            skipped = 0;
+                            if let Ok(img) = dump_framebuffer_to_image(&card, fb, verbose, mask_subs, border_frac) {
+                                let _ = send_dumped_image(&mut socket, &img, verbose);
+                                prev_image = Some(img);
+                            }
+                        }
+                    }
+                } else {
+                    dump_and_send_framebuffer(&mut socket, &card, fb, verbose, mask_subs, border_frac).unwrap();
+                }
             }
             let elapsed = start.elapsed();
             if elapsed < frame_time {
