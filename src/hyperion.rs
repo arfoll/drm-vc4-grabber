@@ -9,7 +9,34 @@ use std::io::Result as StdResult;
 use crate::hyperion_reply_generated::hyperionnet as reply;
 use crate::hyperion_request_generated::hyperionnet as request;
 
+/// Ask the kernel to ACK the next incoming segment immediately.
+///
+/// Hyperion frames replies as a 4-byte length followed by a small payload sent
+/// as separate writes. If our stack holds the ACK for the length segment
+/// (delayed ACK, up to ~40ms) the server's Nagle algorithm cannot release the
+/// payload, stalling every reply (two per captured frame here). TCP_QUICKACK
+/// makes us ACK promptly so the reply is not held back.
+#[cfg(target_os = "linux")]
+fn request_quickack(socket: &TcpStream) {
+    use std::os::unix::io::AsRawFd;
+
+    let one: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn request_quickack(_socket: &TcpStream) {}
+
 pub fn read_reply(socket: &mut TcpStream, verbose : bool) -> StdResult<()> {
+    request_quickack(socket);
     let mut size = [0u8; 4];
     socket.read_exact(&mut size)?;
 
@@ -103,8 +130,9 @@ pub fn send_image(socket: &mut TcpStream, image: & RgbImage, verbose: bool) -> S
     socket.write_all(dat)?;
     socket.flush()?;
 
-    read_reply(socket, verbose)?;
-
+    // The reply to an image is not needed to drive the display. Blocking on it
+    // serialised every frame behind a network round trip, so it is drained
+    // asynchronously instead (see the reader thread in `main`).
     Ok(())
 }
 

@@ -63,9 +63,9 @@ fn save_screenshot(img: &RgbImage) -> Result<(), ImageError> {
 }
 
 fn send_dumped_image(socket: &mut TcpStream, img: &RgbImage, verbose : bool) -> StdResult<()> {
-    register_direct(socket)?;
-    read_reply(socket, verbose)?;
-
+    // Registering is a per-connection handshake; it is done once at startup.
+    // Re-registering every frame added a full request/response round trip per
+    // frame, which was a large part of the frame-time budget.
     send_image(socket, img, verbose)?;
 
     Ok(())
@@ -279,6 +279,13 @@ fn main() {
                 .long("skip-unchanged")
                 .help("Skip frames that haven't changed (samples 32 pixels to detect changes)."),
         )
+        .arg(
+            Arg::with_name("fps")
+                .long("fps")
+                .takes_value(true)
+                .default_value("10")
+                .help("Capture framerate in frames per second (default 10)."),
+        )
         .get_matches();
 
     let verbose = matches.is_present("verbose");
@@ -292,6 +299,11 @@ fn main() {
     let lum_sdr: f32 = matches.value_of("luminance-sdr").unwrap().parse().expect("Invalid luminance-sdr value");
     let sat_hdr: f32 = matches.value_of("saturation").unwrap().parse().expect("Invalid saturation value");
     let border_frac: f32 = matches.value_of("border").unwrap().parse().expect("Invalid border value");
+    let target_fps: f64 = matches.value_of("fps").unwrap().parse().expect("Invalid fps value");
+    assert!(
+        target_fps.is_finite() && target_fps > 0.0,
+        "fps must be a positive number"
+    );
     set_luminance_hdr(lum_hdr);
     set_luminance_sdr(lum_sdr);
     set_saturation_hdr(sat_hdr);
@@ -344,13 +356,25 @@ fn main() {
         }
     } else {
         let mut socket = TcpStream::connect(adress).unwrap();
+        // The Hyperion protocol frames messages as a 4-byte length followed by
+        // the payload, sent as two small writes, and every request is followed
+        // by a small reply. With Nagle enabled this becomes a classic
+        // Nagle + delayed-ACK stall of ~40ms per round trip. Disable it.
+        socket.set_nodelay(true).unwrap();
         register_direct(&mut socket).unwrap();
         read_reply(&mut socket, verbose).unwrap();
 
         send_color_red(&mut socket, verbose).unwrap();
         thread::sleep(Duration::from_secs(1));
 
-        let target_fps = 10.0;
+        // Images no longer wait for a reply, so the server's replies would pile
+        // up in the receive buffer until the TCP window closes and the server
+        // blocks on write. Drain them in the background; we don't act on them.
+        let drain_socket = socket.try_clone().unwrap();
+        thread::spawn(move || {
+            let mut drain = drain_socket;
+            while read_reply(&mut drain, false).is_ok() {}
+        });
 
         let frame_time = Duration::from_secs_f64(1.0 / target_fps);
         let mut prev_samples = [0u32; 32];
