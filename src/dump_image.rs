@@ -17,7 +17,7 @@ use crate::{
     Card,
 };
 
-use std::os::fd::RawFd;
+use std::os::fd::{IntoRawFd, RawFd};
 use nix::sys::mman::{ProtFlags, MapFlags};
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
@@ -611,10 +611,23 @@ fn dump_yuv420_to_image(
     }
 }
 
-/// Fused untile + decimate (nearest) for Intel X-tiled XR30.
-/// - Input: XR30 (10-bit per channel packed into 32bpp words), Intel X-tiling modifier ((1<<56)|1)
+/// Pick the largest integer decimation factor `<= target` that evenly divides
+/// both dimensions. Guarantees the fused tile walker's `dst` indices stay in
+/// bounds for resolutions that aren't cleanly divisible by `target`.
+fn pick_decim(width: u32, height: u32, target: usize) -> usize {
+    let mut d = target;
+    while d > 1 && ((width as usize) % d != 0 || (height as usize) % d != 0) {
+        d -= 1;
+    }
+    d
+}
+
+/// Fused untile + decimate (nearest) + pixel conversion for Intel X-tiled 32bpp.
+/// - Input: any 32bpp format (XR30/AR30 10-bit or XR24/AR24 8-bit) using the
+///   Intel X-tiling modifier ((1<<56)|1)
+/// - `convert` maps one raw 32-bit word to an (R, G, B) triple.
 /// - Output: RgbImage downscaled by integer `decim` (e.g. 6 → 3840x2160 → 640x360)
-fn dump_intel_xtiled_xr30_decimated_to_image(
+fn dump_intel_xtiled_decimated_to_image<F>(
     card: &Card,
     pitch: u32,
     size: (u32, u32),
@@ -622,7 +635,11 @@ fn dump_intel_xtiled_xr30_decimated_to_image(
     decim: usize,
     border_frac: f32,
     verbose: bool,
-) -> Result<image::RgbImage, SystemError> {
+    convert: F,
+) -> Result<image::RgbImage, SystemError>
+where
+    F: Fn(u32) -> (u8, u8, u8),
+{
     // Intel X-tiled 32bpp: 128×8 pixels per tile = 4096 bytes (1024 u32 words)
     const TILE_W: usize = 128;
     const TILE_H: usize = 8;
@@ -649,7 +666,7 @@ fn dump_intel_xtiled_xr30_decimated_to_image(
 
     if verbose {
         println!(
-            "intel x-tiled XR30 (fused decimate), src={:?}, pitch_words={}, tiles=({}x{}), decim={}",
+            "intel x-tiled (fused decimate), src={:?}, pitch_words={}, tiles=({}x{}), decim={}",
             size, pitch_words, tiles_x, tiles_y, decim
         );
     }
@@ -706,17 +723,17 @@ fn dump_intel_xtiled_xr30_decimated_to_image(
                         if !(y_in_interior && src_x >= border_left && src_x < border_right) {
                             let dst_x = src_x / decim;
 
-                            // Fetch XR30 pixel (u32), convert 10→8
-                            let px10 = unsafe { *src.get_unchecked(src_row_start + x) };
-                            let (r8, g8, b8) = ten_to_eight(px10);
+                            // Fetch pixel (u32) and convert to RGB
+                            let px = unsafe { *src.get_unchecked(src_row_start + x) };
+                            let (r8, g8, b8) = convert(px);
 
                             // Write RGB directly into dst buffer
                             let di = (dst_y * dst_w + dst_x) * 3;
                             unsafe {
                                 // bounds guaranteed by construction
-                                *dst_buf.get_unchecked_mut(di + 0) = r8 as u8;
-                                *dst_buf.get_unchecked_mut(di + 1) = g8 as u8;
-                                *dst_buf.get_unchecked_mut(di + 2) = b8 as u8;
+                                *dst_buf.get_unchecked_mut(di + 0) = r8;
+                                *dst_buf.get_unchecked_mut(di + 1) = g8;
+                                *dst_buf.get_unchecked_mut(di + 2) = b8;
                             }
                         }
                     }
@@ -826,6 +843,317 @@ pub fn fast_downscale(image: &RgbImage, factor: u32) -> RgbImage {
         .expect("RGB buffer size mismatch")
 }
 
+/// Intel modifier for `I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC`
+/// (`0x0100000000000008`). drm-fourcc 2.2.0 has no variant for it, so
+/// `DrmModifier::from` produces `Unrecognized(...)`.
+const MOD_I915_Y_TILED_GEN12_RC_CCS_CC: u64 = (1u64 << 56) | 8;
+
+/// A GBM device plus the DRM fd it was created from. The device is created on
+/// the *render* node when one exists: GBM needs to create a GL/pipe context to
+/// blit-decompress render-compressed buffers (see `gbm_dri_bo_map` in Mesa),
+/// and context creation reliably works on the render node even for processes
+/// that are not DRM master. Using the card node here crashes inside the i915
+/// driver (NULL context dereference) when Kodi is the master.
+struct GbmContext {
+    dev: *mut ffi::gbm::gbm_device,
+    fd: RawFd,
+}
+
+// SAFETY: The GbmContext owns its device pointer and render-node fd for the
+// process lifetime (it lives in a static OnceCell). GBM device operations
+// (bo_import/bo_map) are internally synchronised by Mesa, and the pattern
+// mirrors `PersistentMap` above: the device pointer is only ever read after
+// creation. Sharing between threads is therefore safe.
+unsafe impl Send for GbmContext {}
+unsafe impl Sync for GbmContext {}
+
+/// Find and open the render node that belongs to the same DRM device as
+/// `card`, if one exists. Returns `None` when there is no render node
+/// (e.g. Raspberry Pi/VC4), in which case callers fall back to the card fd.
+///
+/// Each DRM device gets its own character-device major (226 for the first
+/// device, 227 for the next, ...); the card node and its render node share
+/// that major. So a `renderD*` entry whose `dev` major matches the card's is
+/// the sibling render node — no need to dig through the card's sysfs device
+/// directory, whose layout varies by kernel.
+fn open_render_node(card: &Card) -> Option<RawFd> {
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+
+    // Major of the opened card node (e.g. 226 for /dev/dri/card1).
+    let fd_meta = fs::metadata(format!("/proc/self/fd/{}", card.as_raw_fd())).ok()?;
+    let card_major = libc::major(fd_meta.rdev());
+
+    let drm_dir = fs::read_dir("/sys/class/drm").ok()?;
+    for entry in drm_dir.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(rest) = name.strip_prefix("renderD") else {
+            continue;
+        };
+        if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let devinfo = match fs::read_to_string(format!("/sys/class/drm/{}/dev", name)) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mut it = devinfo.trim().split(':');
+        let (Ok(maj), Ok(_minor)) =
+            (it.next().unwrap_or("").parse::<u32>(), it.next().unwrap_or("").parse::<u32>())
+        else {
+            continue;
+        };
+        if maj != card_major {
+            continue;
+        }
+        let path = format!("/dev/dri/{}", name);
+        if let Ok(f) = fs::OpenOptions::new().read(true).write(true).open(&path) {
+            return Some(f.into_raw_fd());
+        }
+    }
+    None
+}
+
+/// Cached GBM device, created lazily. Prefers the render node when one exists
+/// (`open_render_node`); falls back to the card fd (no render node, e.g. VC4).
+/// The render-node fd is kept open for the device's lifetime because GBM does
+/// not duplicate the fd passed to `gbm_create_device`.
+static GBM_DEVICE: OnceCell<GbmContext> = OnceCell::new();
+
+/// Read a framebuffer through GBM. Returns a linear, detiled and decompressed
+/// 32bpp buffer plus its stride in words.
+///
+/// On modern Intel (Gen12+, e.g. Alder Lake-N) Kodi's GBM scanout buffer is
+/// render-compressed (`Y_TILED_GEN12_RC_CCS*`). Reading the dma-buf directly
+/// yields compressed garbage; `gbm_bo_map` asks the driver to detile and
+/// decompress it (via the blitter) so we can read plain linear pixels.
+fn gbm_read_framebuffer(
+    card: &Card,
+    fbinfo2: &drm_sys::drm_mode_fb_cmd2,
+    verbose: bool,
+) -> Result<(Vec<u32>, usize), SystemError> {
+    use ffi::gbm;
+    use std::ffi::c_void;
+
+    let raw_fd = card.as_raw_fd();
+
+    // The kernel fills handles/pitches/offsets for the first `num_planes`
+    // entries; the struct is zero-initialised by `ffi::fb_cmd2`, so any unused
+    // trailing entries stay zero.
+    let mut num_planes = 0usize;
+    for i in 0..4 {
+        if fbinfo2.handles[i] != 0 {
+            num_planes = i + 1;
+        }
+    }
+    if num_planes == 0 {
+        return Err(SystemError::InvalidArgument);
+    }
+
+    eprintln!(
+        "[gbm] step 1: fb {}x{} fmt 0x{:x} mod 0x{:x}, {} plane(s), pitches {:?}, offsets {:?}",
+        fbinfo2.width,
+        fbinfo2.height,
+        fbinfo2.pixel_format,
+        fbinfo2.modifier[0],
+        num_planes,
+        &fbinfo2.pitches[..num_planes],
+        &fbinfo2.offsets[..num_planes]
+    );
+
+    let mut import = gbm::gbm_import_fd_modifier_data {
+        width: fbinfo2.width,
+        height: fbinfo2.height,
+        format: fbinfo2.pixel_format,
+        num_fds: num_planes as u32,
+        fds: [0; 4],
+        strides: [0; 4],
+        offsets: [0; 4],
+        modifier: fbinfo2.modifier[0],
+    };
+
+    let mut opened = [0i32; 4];
+    for i in 0..num_planes {
+        let hfd = ffi::prime_handle_to_fd(raw_fd, fbinfo2.handles[i])?;
+        import.fds[i] = hfd;
+        import.strides[i] = fbinfo2.pitches[i] as i32;
+        import.offsets[i] = fbinfo2.offsets[i] as i32;
+        opened[i] = hfd;
+    }
+
+    let ctx = GBM_DEVICE.get_or_init(|| {
+        let fd = open_render_node(card).unwrap_or(raw_fd);
+        let dev = unsafe { gbm::gbm_create_device(fd) };
+        GbmContext { dev, fd }
+    });
+    let dev = ctx.dev;
+    eprintln!(
+        "[gbm] step 2: device @ {:p} (fd {}, render node: {})",
+        dev,
+        ctx.fd,
+        ctx.fd != raw_fd
+    );
+    if dev.is_null() {
+        for fd in opened.iter().take(num_planes) {
+            unsafe {
+                close(*fd);
+            }
+        }
+        return Err(SystemError::Unknown {
+            errno: nix::errno::Errno::EINVAL,
+        });
+    }
+
+    let bo = unsafe {
+        gbm::gbm_bo_import(
+            dev,
+            gbm::GBM_BO_IMPORT_FD_MODIFIER,
+            &mut import as *mut _ as *mut c_void,
+            gbm::GBM_BO_USE_SCANOUT | gbm::GBM_BO_USE_RENDERING,
+        )
+    };
+    eprintln!("[gbm] step 3: import -> {:p}", bo);
+
+    // gbm_bo_import duplicates the fds, so our copies can be closed right away.
+    for fd in opened.iter().take(num_planes) {
+        unsafe {
+            close(*fd);
+        }
+    }
+
+    if bo.is_null() {
+        return Err(SystemError::Unknown {
+            errno: nix::errno::Errno::EINVAL,
+        });
+    }
+
+    let mut stride: u32 = 0;
+    let mut map_data: *mut c_void = std::ptr::null_mut();
+    eprintln!("[gbm] step 4: gbm_bo_map({}x{}x{})...", fbinfo2.width, fbinfo2.height, std::mem::size_of::<u32>() * 8);
+    let ptr = unsafe {
+        gbm::gbm_bo_map(
+            bo,
+            0,
+            0,
+            fbinfo2.width,
+            fbinfo2.height,
+            gbm::GBM_BO_TRANSFER_READ,
+            &mut stride,
+            &mut map_data,
+        )
+    };
+    eprintln!("[gbm] step 5: map -> {:p} stride {} map_data {:p}", ptr, stride, map_data);
+    if ptr.is_null() {
+        unsafe {
+            gbm::gbm_bo_destroy(bo);
+        }
+        return Err(SystemError::Unknown {
+            errno: nix::errno::Errno::EINVAL,
+        });
+    }
+
+    let nwords = (stride as usize * fbinfo2.height as usize) / 4;
+    let mut out = vec![0u32; nwords];
+    eprintln!("[gbm] step 6: copying {} words ({} bytes)", nwords, nwords * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(ptr as *const u32, out.as_mut_ptr(), nwords);
+        gbm::gbm_bo_unmap(bo, map_data);
+        gbm::gbm_bo_destroy(bo);
+    }
+
+    if verbose {
+        println!(
+            "gbm: imported {} plane(s), modifier 0x{:x}, mapped stride {}, {} words",
+            num_planes, import.modifier, stride, nwords
+        );
+    }
+
+    Ok((out, stride as usize / 4))
+}
+
+/// Fused decimate + pixel conversion over a linear 32bpp buffer, honouring the
+/// source stride (the GBM mapping may be padded).
+fn decimate_linear_32<F>(
+    size: (u32, u32),
+    stride_words: usize,
+    src: &[u32],
+    decim: usize,
+    border_frac: f32,
+    convert: F,
+) -> RgbImage
+where
+    F: Fn(u32) -> (u8, u8, u8),
+{
+    let width = size.0 as usize;
+    let height = size.1 as usize;
+    let dw = width / decim;
+    let dh = height / decim;
+
+    let border_active = border_frac > 0.0;
+    let border_top = (height as f32 * border_frac) as usize;
+    let border_bot = height.saturating_sub(border_top);
+    let border_left = (width as f32 * border_frac) as usize;
+    let border_right = width.saturating_sub(border_left);
+
+    let mut img = RgbImage::new(dw as u32, dh as u32);
+    let dst = img.as_mut();
+
+    for dy in 0..dh {
+        let sy = dy * decim;
+        let y_interior = border_active && sy >= border_top && sy < border_bot;
+        for dx in 0..dw {
+            let sx = dx * decim;
+            if y_interior && sx >= border_left && sx < border_right {
+                continue;
+            }
+            let px = src[sy * stride_words + sx];
+            let (r, g, b) = convert(px);
+            let di = (dy * dw + dx) * 3;
+            dst[di] = r;
+            dst[di + 1] = g;
+            dst[di + 2] = b;
+        }
+    }
+
+    img
+}
+
+/// Decode an Intel Y-tiled / render-compressed framebuffer by round-tripping it
+/// through GBM (detile + decompress) and then reading it linearly.
+fn dump_intel_gbm_to_image(
+    card: &Card,
+    fbinfo2: &drm_sys::drm_mode_fb_cmd2,
+    size: (u32, u32),
+    ten_bit: bool,
+    border_frac: f32,
+    verbose: bool,
+) -> Result<RgbImage, SystemError> {
+    let (buf, stride_words) = gbm_read_framebuffer(card, fbinfo2, verbose)?;
+
+    let convert = move |px: u32| -> (u8, u8, u8) {
+        if ten_bit {
+            let (r, g, b) = ten_to_eight(px);
+            (r as u8, g as u8, b as u8)
+        } else {
+            (
+                ((px >> 16) & 0xff) as u8,
+                ((px >> 8) & 0xff) as u8,
+                (px & 0xff) as u8,
+            )
+        }
+    };
+
+    Ok(decimate_linear_32(
+        size,
+        stride_words,
+        &buf,
+        pick_decim(size.0, size.1, 6),
+        border_frac,
+        convert,
+    ))
+}
+
 pub fn dump_framebuffer_to_image(
     card: &Card,
     fb: Handle,
@@ -854,10 +1182,13 @@ pub fn dump_framebuffer_to_image(
     }
 
     let fourcc = drm_fourcc::DrmFourcc::try_from(fbinfo2.pixel_format).unwrap();
-    let modifier = drm_fourcc::DrmModifier::try_from(fbinfo2.modifier[0]).unwrap();
+    // Use `From` so unrecognized modifiers become `Unrecognized(..)` and can be
+    // matched explicitly (drm-fourcc 2.2.0 has no variant for
+    // `Y_TILED_GEN12_RC_CCS_CC`).
+    let modifier = drm_fourcc::DrmModifier::from(fbinfo2.modifier[0]);
 
     let image_result = match fourcc {
-        DrmFourcc::Xrgb8888 => match modifier {
+        DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888 => match modifier {
             DrmModifier::Broadcom_vc4_t_tiled => {
                 dump_broadcom_tiled_to_image(card, size, 32, fbinfo2.handles[0], verbose)
             }
@@ -870,13 +1201,32 @@ pub fn dump_framebuffer_to_image(
                 border_frac,
                 verbose,
             ),
+            DrmModifier::I915_x_tiled => dump_intel_xtiled_decimated_to_image(
+                card,
+                fbinfo2.pitches[0],
+                size,
+                fbinfo2.handles[0],
+                pick_decim(size.0, size.1, 6),
+                border_frac,
+                verbose,
+                |px| (((px >> 16) & 0xff) as u8, ((px >> 8) & 0xff) as u8, (px & 0xff) as u8),
+            ),
+            // Y-tiled and Gen12 render-compressed (RC/MC CCS) buffers are read
+            // back via GBM, which detiles and decompresses them.
+            DrmModifier::I915_y_tiled
+            | DrmModifier::I915_y_tiled_ccs
+            | DrmModifier::I915_y_tiled_gen12_mc_ccs
+            | DrmModifier::I915_y_tiled_gen12_rc_ccs
+            | DrmModifier::Unrecognized(MOD_I915_Y_TILED_GEN12_RC_CCS_CC) => {
+                dump_intel_gbm_to_image(card, &fbinfo2, size, false, border_frac, verbose)
+            }
             _ => panic!("Unsupported framebuffer modifier: {:?}", modifier),
         },
-        DrmFourcc::Argb8888 => match modifier {
-            DrmModifier::Broadcom_vc4_t_tiled => {
-                dump_broadcom_tiled_to_image(card, size, 32, fbinfo2.handles[0], verbose)
-            }
-            DrmModifier::Linear => dump_linear_to_image(
+        // Kodi prefers an EGL config with an alpha channel, so Intel scanout
+        // buffers are usually AR30/AR24 rather than XR30/XR24. Both share the
+        // same R/G/B bit layout, so decode them together.
+        DrmFourcc::Xrgb2101010 | DrmFourcc::Argb2101010 => match modifier {
+            DrmModifier::Linear => dump_linear_xr30_to_image(
                 card,
                 fbinfo2.pitches[0],
                 size,
@@ -885,23 +1235,30 @@ pub fn dump_framebuffer_to_image(
                 border_frac,
                 verbose,
             ),
-            _ => panic!("Unsupported framebuffer modifier: {:?}", modifier),
-        },
-        DrmFourcc::Xrgb2101010 => {
-        if fbinfo2.modifier[0] == ((1u64 << 56) | 1) {
-            // Choose your integer factor. 6 → 640x360 from 3840x2160.
-            let decim = 6usize;
-                dump_intel_xtiled_xr30_decimated_to_image(
-                  card, fbinfo2.pitches[0], size, fbinfo2.handles[0], decim, border_frac, verbose,
-                )
-            } else {
-                dump_linear_xr30_to_image(
-                    card, fbinfo2.pitches[0], size, 32, fbinfo2.handles[0], border_frac, verbose,
-                )
+            DrmModifier::I915_x_tiled => dump_intel_xtiled_decimated_to_image(
+                card,
+                fbinfo2.pitches[0],
+                size,
+                fbinfo2.handles[0],
+                pick_decim(size.0, size.1, 6),
+                border_frac,
+                verbose,
+                |px| {
+                    let (r, g, b) = ten_to_eight(px);
+                    (r as u8, g as u8, b as u8)
+                },
+            ),
+            // Y-tiled and Gen12 render-compressed (RC/MC CCS) buffers: read
+            // back via GBM so the driver detiles/decompresses them.
+            DrmModifier::I915_y_tiled
+            | DrmModifier::I915_y_tiled_ccs
+            | DrmModifier::I915_y_tiled_gen12_mc_ccs
+            | DrmModifier::I915_y_tiled_gen12_rc_ccs
+            | DrmModifier::Unrecognized(MOD_I915_Y_TILED_GEN12_RC_CCS_CC) => {
+                dump_intel_gbm_to_image(card, &fbinfo2, size, true, border_frac, verbose)
             }
-        }
-        DrmFourcc::Argb2101010 => {
-            dump_linear_xr30_to_image(
+            // Any other modifier: assume the buffer is linear.
+            _ => dump_linear_xr30_to_image(
                 card,
                 fbinfo2.pitches[0],
                 size,
@@ -909,7 +1266,7 @@ pub fn dump_framebuffer_to_image(
                 fbinfo2.handles[0],
                 border_frac,
                 verbose,
-            )
+            ),
         },
         DrmFourcc::Yuv420 => dump_yuv420_to_image(
             card,

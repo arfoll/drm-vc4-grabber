@@ -55,3 +55,64 @@ pub fn gem_close(fd: RawFd, handle: u32) -> Result<(), SystemError> {
 
     Ok(())
 }
+
+/// Minimal bindings to libgbm. We use GBM only to import an existing
+/// framebuffer (as a dma-buf with its format modifier) and map it back to CPU
+/// memory. For tiled/compressed Intel buffers `gbm_bo_map` transparently
+/// detiles/decompresses via the driver, which is the only reliable way to read
+/// render-compressed (RC_CCS) scanout buffers from userspace.
+pub mod gbm {
+    use std::ffi::c_void;
+    use std::os::unix::io::RawFd;
+
+    #[repr(C)]
+    pub struct gbm_device {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    pub struct gbm_bo {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    pub struct gbm_import_fd_modifier_data {
+        pub width: u32,
+        pub height: u32,
+        pub format: u32,
+        pub num_fds: u32,
+        pub fds: [i32; 4],
+        pub strides: [i32; 4],
+        pub offsets: [i32; 4],
+        pub modifier: u64,
+    }
+
+    pub const GBM_BO_IMPORT_FD_MODIFIER: u32 = 0x5504;
+    pub const GBM_BO_USE_SCANOUT: u32 = 1 << 0;
+    pub const GBM_BO_USE_RENDERING: u32 = 1 << 2;
+    pub const GBM_BO_TRANSFER_READ: u32 = 1 << 0;
+
+    #[link(name = "gbm")]
+    extern "C" {
+        pub fn gbm_create_device(fd: RawFd) -> *mut gbm_device;
+        pub fn gbm_device_destroy(dev: *mut gbm_device);
+        pub fn gbm_bo_import(
+            dev: *mut gbm_device,
+            type_: u32,
+            buffer: *mut c_void,
+            flags: u32,
+        ) -> *mut gbm_bo;
+        pub fn gbm_bo_map(
+            bo: *mut gbm_bo,
+            x: u32,
+            y: u32,
+            width: u32,
+            height: u32,
+            flags: u32,
+            stride: *mut u32,
+            map_data: *mut *mut c_void,
+        ) -> *mut c_void;
+        pub fn gbm_bo_unmap(bo: *mut gbm_bo, map_data: *mut c_void);
+        pub fn gbm_bo_destroy(bo: *mut gbm_bo);
+    }
+}

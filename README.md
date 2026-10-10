@@ -37,6 +37,19 @@ directly uploads the images.
 1. RUSTFLAGS="-C target-cpu=native -C opt-level=3" cargo build --release
 2. Seems to run stable at ~10fps at ~30% CPU load with a 4K/HDR stream
 
+## Compiling for Intel Gen12+ (e.g. N250 / Alder Lake-N)
+Requires `libgbm` at link time (already present anywhere Mesa/Kodi is installed).
+
+1. RUSTFLAGS="-C target-cpu=native -C opt-level=3" cargo build --release
+
+On these GPUs Kodi may use a render-compressed (`Y_TILED_GEN12_RC_CCS*`)
+scanout buffer, which cannot be read directly from the dma-buf. The grabber
+detects the Intel Y-tiled/compressed modifiers and reads the framebuffer back
+through GBM, letting the driver detile and decompress it. No changes to Kodi
+are needed; `INTEL_DEBUG=noccs` is an alternative workaround but is not
+required. Run once with `-v` to confirm the capture path, e.g.
+`gbm: imported 3 plane(s), modifier 0x100000000000008, mapped stride 15360`.
+
 ## Parameters for running with reasonable colours
 ./target/release/drm-vc4-grabber -d /dev/dri/card1 -a localhost:19400 -m --luminance-hdr 2 --saturation 1.5 --luminance-sdr 0.7
 
