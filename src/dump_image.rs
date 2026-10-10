@@ -246,6 +246,44 @@ fn pq_eotf(v: f32) -> f32 {
     (num / den).powf(1.0 / M1)
 }
 
+/// Lookup tables for the per-channel part of `ten_to_eight`.
+///
+/// The 10-bit code space has only 1024 values, and the nonlinear chain
+/// (PQ EOTF -> tone map -> gamma, or the simple SDR power curve) depends only
+/// on those fixed constants, not on the runtime luminance/saturation. So the
+/// expensive `powf` chain is evaluated 1024 times up front instead of once per
+/// output pixel per frame. This removes the dominant cost of 10-bit capture.
+static PQ_CHANNEL_LUT: OnceCell<[f32; 1024]> = OnceCell::new();
+static SDR_CHANNEL_LUT: OnceCell<[f32; 1024]> = OnceCell::new();
+
+#[inline]
+fn pq_channel_lut() -> &'static [f32; 1024] {
+    PQ_CHANNEL_LUT.get_or_init(|| {
+        const EXPOSURE: f32 = 10.0;
+        let mut lut = [0f32; 1024];
+        for (i, slot) in lut.iter_mut().enumerate() {
+            let v = i as f32 / 1023.0;
+            let lin = pq_eotf(v);
+            // Reinhard tone map + sRGB gamma encode
+            let tonemapped = (lin * EXPOSURE) / (1.0 + lin * EXPOSURE);
+            *slot = tonemapped.powf(1.0 / 2.2);
+        }
+        lut
+    })
+}
+
+#[inline]
+fn sdr_channel_lut() -> &'static [f32; 1024] {
+    SDR_CHANNEL_LUT.get_or_init(|| {
+        const GAMMA: f32 = 0.55;
+        let mut lut = [0f32; 1024];
+        for (i, slot) in lut.iter_mut().enumerate() {
+            *slot = (i as f32 / 1023.0).powf(GAMMA);
+        }
+        lut
+    })
+}
+
 /// Convert in-place from XRGB2101010/ARGB2101010 to XRGB8888 order.
 /// Input: 0b XX RRRRRRRRRR GGGGGGGGGG BBBBBBBBBB (bits: 31..0)
 /// Output (LE memory): u32 with bytes [BB, GG, RR, 00]
@@ -255,30 +293,21 @@ fn pq_eotf(v: f32) -> f32 {
 /// - HDR_PQ_MODE: Proper PQ decode + Reinhard tone mapping
 #[inline]
 fn ten_to_eight(v10: u32) -> (u32, u32, u32) {
-    // Extract full 10-bit values
-    let r10 = ((v10 >> 20) & 0x3FF) as f32 / 1023.0;
-    let g10 = ((v10 >> 10) & 0x3FF) as f32 / 1023.0;
-    let b10 = (v10 & 0x3FF) as f32 / 1023.0;
+    // Extract full 10-bit values; they are LUT indices, not normalized inputs.
+    let r10 = ((v10 >> 20) & 0x3FF) as usize;
+    let g10 = ((v10 >> 10) & 0x3FF) as usize;
+    let b10 = (v10 & 0x3FF) as usize;
 
     if HDR_PQ_MODE.load(Ordering::Relaxed) {
+        let lut = pq_channel_lut();
         let lum = f32::from_bits(LUMINANCE_HDR.load(Ordering::Relaxed));
         let sat = f32::from_bits(SATURATION_HDR.load(Ordering::Relaxed));
 
-        // Proper PQ decode + tone mapping
-        let r_lin = pq_eotf(r10);
-        let g_lin = pq_eotf(g10);
-        let b_lin = pq_eotf(b10);
-
-        // Reinhard tone mapping with high exposure for punchy LED colors
-        const EXPOSURE: f32 = 10.0;
-        let tonemap = |x: f32| (x * EXPOSURE) / (1.0 + x * EXPOSURE);
-
-        // Apply tone mapping and gamma encode to sRGB
-        let gamma = |x: f32| x.powf(1.0 / 2.2);
-
-        let mut r = gamma(tonemap(r_lin));
-        let mut g = gamma(tonemap(g_lin));
-        let mut b = gamma(tonemap(b_lin));
+        // PQ decode + tone map + gamma all come from the LUT; only the
+        // cross-channel saturation and luminance scaling remain per pixel.
+        let mut r = lut[r10];
+        let mut g = lut[g10];
+        let mut b = lut[b10];
 
         // Boost saturation to compensate for BT.2020 -> BT.709 gamut loss
         let avg = (r + g + b) / 3.0;
@@ -287,19 +316,20 @@ fn ten_to_eight(v10: u32) -> (u32, u32, u32) {
         b = avg + (b - avg) * sat;
 
         // Apply luminance and convert to 8-bit
-        let r8 = (r * lum * 255.0).clamp(0.0, 255.0) as u32;
-        let g8 = (g * lum * 255.0).clamp(0.0, 255.0) as u32;
-        let b8 = (b * lum * 255.0).clamp(0.0, 255.0) as u32;
+        let scale = lum * 255.0;
+        let r8 = (r * scale).clamp(0.0, 255.0) as u32;
+        let g8 = (g * scale).clamp(0.0, 255.0) as u32;
+        let b8 = (b * scale).clamp(0.0, 255.0) as u32;
 
         (r8, g8, b8)
     } else {
+        let lut = sdr_channel_lut();
         let lum = f32::from_bits(LUMINANCE_SDR.load(Ordering::Relaxed));
 
-        // Simple power curve (faster, good enough for most content)
-        const GAMMA: f32 = 0.55;
-        let r8 = (r10.powf(GAMMA) * lum * 255.0).clamp(0.0, 255.0) as u32;
-        let g8 = (g10.powf(GAMMA) * lum * 255.0).clamp(0.0, 255.0) as u32;
-        let b8 = (b10.powf(GAMMA) * lum * 255.0).clamp(0.0, 255.0) as u32;
+        let scale = lum * 255.0;
+        let r8 = (lut[r10] * scale).clamp(0.0, 255.0) as u32;
+        let g8 = (lut[g10] * scale).clamp(0.0, 255.0) as u32;
+        let b8 = (lut[b10] * scale).clamp(0.0, 255.0) as u32;
 
         (r8, g8, b8)
     }
@@ -932,18 +962,26 @@ fn open_render_node(card: &Card) -> Option<RawFd> {
 /// not duplicate the fd passed to `gbm_create_device`.
 static GBM_DEVICE: OnceCell<GbmContext> = OnceCell::new();
 
-/// Read a framebuffer through GBM. Returns a linear, detiled and decompressed
-/// 32bpp buffer plus its stride in words.
+/// Import a framebuffer through GBM, map it (detile + decompress) and hand the
+/// linear mapping to `f` before unmapping.
 ///
 /// On modern Intel (Gen12+, e.g. Alder Lake-N) Kodi's GBM scanout buffer is
 /// render-compressed (`Y_TILED_GEN12_RC_CCS*`). Reading the dma-buf directly
 /// yields compressed garbage; `gbm_bo_map` asks the driver to detile and
 /// decompress it (via the blitter) so we can read plain linear pixels.
-fn gbm_read_framebuffer(
+///
+/// Processing the mapping in place (rather than copying it into a fresh `Vec`)
+/// saves a full-frame allocation plus memcpy on every capture — for 4K that is
+/// 16 MB per frame.
+fn gbm_with_mapped<R, F>(
     card: &Card,
     fbinfo2: &drm_sys::drm_mode_fb_cmd2,
     verbose: bool,
-) -> Result<(Vec<u32>, usize), SystemError> {
+    f: F,
+) -> Result<R, SystemError>
+where
+    F: FnOnce(&[u32], usize) -> R,
+{
     use ffi::gbm;
     use std::ffi::c_void;
 
@@ -1044,9 +1082,15 @@ fn gbm_read_framebuffer(
     }
 
     let nwords = (stride as usize * fbinfo2.height as usize) / 4;
-    let mut out = vec![0u32; nwords];
+    let stride_words = stride as usize / 4;
+
+    // Run the caller's work while the mapping is live (no full-buffer copy).
+    let result = unsafe {
+        let slice = std::slice::from_raw_parts(ptr as *const u32, nwords);
+        f(slice, stride_words)
+    };
+
     unsafe {
-        std::ptr::copy_nonoverlapping(ptr as *const u32, out.as_mut_ptr(), nwords);
         gbm::gbm_bo_unmap(bo, map_data);
         gbm::gbm_bo_destroy(bo);
     }
@@ -1058,7 +1102,7 @@ fn gbm_read_framebuffer(
         );
     }
 
-    Ok((out, stride as usize / 4))
+    Ok(result)
 }
 
 /// Fused decimate + pixel conversion over a linear 32bpp buffer, honouring the
@@ -1091,19 +1135,128 @@ where
     for dy in 0..dh {
         let sy = dy * decim;
         let y_interior = border_active && sy >= border_top && sy < border_bot;
+        let src_row = &src[sy * stride_words..];
+        let dst_row = &mut dst[dy * dw * 3..dy * dw * 3 + dw * 3];
         for dx in 0..dw {
             let sx = dx * decim;
             if y_interior && sx >= border_left && sx < border_right {
                 continue;
             }
-            let px = src[sy * stride_words + sx];
+            // Bounds are structural: sx < width <= stride_words, and the writes
+            // stay inside the 3-wide slice for this row.
+            let px = unsafe { *src_row.get_unchecked(sx) };
             let (r, g, b) = convert(px);
-            let di = (dy * dw + dx) * 3;
-            dst[di] = r;
-            dst[di + 1] = g;
-            dst[di + 2] = b;
+            let o = dx * 3;
+            unsafe {
+                *dst_row.get_unchecked_mut(o) = r;
+                *dst_row.get_unchecked_mut(o + 1) = g;
+                *dst_row.get_unchecked_mut(o + 2) = b;
+            }
         }
     }
+
+    img
+}
+
+/// Fused decimate + 10-bit ↔ 8-bit conversion for the GBM path, specialized for
+/// `XRGB2101010`/`ARGB2101010` sources.
+///
+/// This mirrors `decimate_linear_32` with `ten_to_eight` as the converter, but:
+/// - all tone-mapping state (PQ vs SDR, LUT, luminance, saturation) is resolved
+///   once per frame instead of once per pixel with atomic loads and a
+///   `OnceCell` check, and
+/// - rows are independent, so work is spread across all cores with rayon
+///   (the same pattern `fast_downscale` already uses).
+///
+/// Output is identical to the generic path.
+fn decimate_linear_32_tenbit(
+    size: (u32, u32),
+    stride_words: usize,
+    src: &[u32],
+    decim: usize,
+    border_frac: f32,
+) -> RgbImage {
+    let width = size.0 as usize;
+    let height = size.1 as usize;
+    let dw = width / decim;
+    let dh = height / decim;
+
+    // Resolve the conversion state once, before the pixel loops.
+    let hdr = HDR_PQ_MODE.load(Ordering::Relaxed);
+    let (lut, lum, sat) = if hdr {
+        (
+            pq_channel_lut(),
+            f32::from_bits(LUMINANCE_HDR.load(Ordering::Relaxed)),
+            f32::from_bits(SATURATION_HDR.load(Ordering::Relaxed)),
+        )
+    } else {
+        (
+            sdr_channel_lut(),
+            f32::from_bits(LUMINANCE_SDR.load(Ordering::Relaxed)),
+            0.0,
+        )
+    };
+    let scale = lum * 255.0;
+
+    let border_active = border_frac > 0.0;
+    let border_top = (height as f32 * border_frac) as usize;
+    let border_bot = height.saturating_sub(border_top);
+    let border_left = (width as f32 * border_frac) as usize;
+    let border_right = width.saturating_sub(border_left);
+
+    let mut img = RgbImage::new(dw as u32, dh as u32);
+    let dst = img.as_mut();
+    let mut dst_rows: Vec<&mut [u8]> = dst.chunks_exact_mut(dw * 3).collect();
+
+    dst_rows.par_iter_mut().enumerate().for_each(|(dy, row)| {
+        let sy = dy * decim;
+        let src_row = &src[sy * stride_words..];
+        let interior = border_active && sy >= border_top && sy < border_bot;
+        if hdr {
+            for dx in 0..dw {
+                let sx = dx * decim;
+                if interior && sx >= border_left && sx < border_right {
+                    continue;
+                }
+                let px = unsafe { *src_row.get_unchecked(sx) };
+                let r = unsafe { *lut.get_unchecked(((px >> 20) & 0x3FF) as usize) };
+                let g = unsafe { *lut.get_unchecked(((px >> 10) & 0x3FF) as usize) };
+                let b = unsafe { *lut.get_unchecked((px & 0x3FF) as usize) };
+                // PQ decode + tone map + gamma come from the LUT; only the
+                // cross-channel saturation and luminance scaling remain.
+                let avg = (r + g + b) / 3.0;
+                let (r, g, b) = (
+                    (avg + (r - avg) * sat) * scale,
+                    (avg + (g - avg) * sat) * scale,
+                    (avg + (b - avg) * sat) * scale,
+                );
+                let o = dx * 3;
+                unsafe {
+                    *row.get_unchecked_mut(o) = r.clamp(0.0, 255.0) as u8;
+                    *row.get_unchecked_mut(o + 1) = g.clamp(0.0, 255.0) as u8;
+                    *row.get_unchecked_mut(o + 2) = b.clamp(0.0, 255.0) as u8;
+                }
+            }
+        } else {
+            for dx in 0..dw {
+                let sx = dx * decim;
+                if interior && sx >= border_left && sx < border_right {
+                    continue;
+                }
+                let px = unsafe { *src_row.get_unchecked(sx) };
+                let r = unsafe { *lut.get_unchecked(((px >> 20) & 0x3FF) as usize) };
+                let g = unsafe { *lut.get_unchecked(((px >> 10) & 0x3FF) as usize) };
+                let b = unsafe { *lut.get_unchecked((px & 0x3FF) as usize) };
+                let (r, g, b) = (r * scale, g * scale, b * scale);
+                let o = dx * 3;
+                unsafe {
+                    *row.get_unchecked_mut(o) = r.clamp(0.0, 255.0) as u8;
+                    *row.get_unchecked_mut(o + 1) = g.clamp(0.0, 255.0) as u8;
+                    *row.get_unchecked_mut(o + 2) = b.clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    });
 
     img
 }
@@ -1118,29 +1271,35 @@ fn dump_intel_gbm_to_image(
     border_frac: f32,
     verbose: bool,
 ) -> Result<RgbImage, SystemError> {
-    let (buf, stride_words) = gbm_read_framebuffer(card, fbinfo2, verbose)?;
+    let decim = pick_decim(size.0, size.1, 6);
 
-    let convert = move |px: u32| -> (u8, u8, u8) {
-        if ten_bit {
-            let (r, g, b) = ten_to_eight(px);
-            (r as u8, g as u8, b as u8)
-        } else {
+    if ten_bit {
+        // Specialized 10-bit path: conversion state resolved once per frame and
+        // rows processed in parallel.
+        gbm_with_mapped(card, fbinfo2, verbose, |buf, stride_words| {
+            decimate_linear_32_tenbit(size, stride_words, buf, decim, border_frac)
+        })
+    } else {
+        let convert = move |px: u32| -> (u8, u8, u8) {
             (
                 ((px >> 16) & 0xff) as u8,
                 ((px >> 8) & 0xff) as u8,
                 (px & 0xff) as u8,
             )
-        }
-    };
+        };
 
-    Ok(decimate_linear_32(
-        size,
-        stride_words,
-        &buf,
-        pick_decim(size.0, size.1, 6),
-        border_frac,
-        convert,
-    ))
+        // Decimate straight out of the GBM mapping instead of copying it first.
+        gbm_with_mapped(card, fbinfo2, verbose, |buf, stride_words| {
+            decimate_linear_32(
+                size,
+                stride_words,
+                buf,
+                decim,
+                border_frac,
+                convert,
+            )
+        })
+    }
 }
 
 pub fn dump_framebuffer_to_image(
@@ -1302,4 +1461,58 @@ pub fn dump_framebuffer_to_image(
         mask_subtitles(&mut image, 0.20, 0.15);
     }
     Ok(image)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synth(width: usize, height: usize) -> Vec<u32> {
+        // Deterministic pseudo-random 10-bit packed pixels.
+        (0..width * height)
+            .map(|i| {
+                let x = i as u32;
+                ((x.wrapping_mul(2654435761) & 0x3FF))
+                    | ((x.wrapping_mul(40503) & 0x3FF) << 10)
+                    | ((x.wrapping_mul(2246822519) & 0x3FF) << 20)
+            })
+            .collect()
+    }
+
+    /// The specialized 10-bit decimate must be bit-identical to the generic
+    /// `decimate_linear_32` + `ten_to_eight` path, in both HDR and SDR mode and
+    /// with the border mask on and off.
+    #[test]
+    fn tenbit_decimate_matches_generic() {
+        let (width, height) = (3840usize, 2160usize);
+        let src = synth(width, height);
+        let size = (width as u32, height as u32);
+        let decim = pick_decim(size.0, size.1, 6);
+
+        for &hdr in &[true, false] {
+            HDR_PQ_MODE.store(hdr, Ordering::Relaxed);
+            for &border in &[0.0f32, 0.1] {
+                let generic = decimate_linear_32(
+                    size,
+                    width,
+                    &src,
+                    decim,
+                    border,
+                    |px| {
+                        let (r, g, b) = ten_to_eight(px);
+                        (r as u8, g as u8, b as u8)
+                    },
+                );
+                let specialized =
+                    decimate_linear_32_tenbit(size, width, &src, decim, border);
+                assert_eq!(
+                    generic.as_raw(),
+                    specialized.as_raw(),
+                    "hdr={} border={}",
+                    hdr,
+                    border
+                );
+            }
+        }
+    }
 }

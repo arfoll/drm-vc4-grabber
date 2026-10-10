@@ -2,8 +2,11 @@
 extern crate nix;
 
 use std::fs::{File, OpenOptions};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::os::fd::AsFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 
 use clap::{App, Arg};
 use drm::control::framebuffer::Handle;
@@ -62,31 +65,131 @@ fn save_screenshot(img: &RgbImage) -> Result<(), ImageError> {
     img.save("screenshot.png")
 }
 
-fn send_dumped_image(socket: &mut TcpStream, img: &RgbImage, verbose : bool) -> StdResult<()> {
-    // Registering is a per-connection handshake; it is done once at startup.
-    // Re-registering every frame added a full request/response round trip per
-    // frame, which was a large part of the frame-time budget.
-    send_image(socket, img, verbose)?;
+/// How long to wait between reconnection attempts after the server goes away.
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(3);
 
-    Ok(())
+/// A live connection to the Hyperion server.
+///
+/// The server sends a reply for every request. Images don't wait for them (that
+/// would serialise every frame behind a round trip), so a background thread
+/// drains them. If either the reader or a write fails, the connection is marked
+/// dead and the caller replaces it.
+struct Connection {
+    stream: TcpStream,
+    alive: Arc<AtomicBool>,
+    drain: Option<JoinHandle<()>>,
 }
 
-fn dump_and_send_framebuffer(
-    socket: &mut TcpStream,
-    card: &Card,
-    fb: Handle,
-    verbose: bool,
-    mask_subs: bool,
-    border_frac: f32,
-) -> StdResult<()> {
-    let img = dump_framebuffer_to_image(card, fb, verbose, mask_subs, border_frac);
-    if let Ok(img) = img {
-        send_dumped_image(socket, &img, verbose)?;
-    } else {
-        println!("Error dumping framebuffer to image.");
+impl Connection {
+    /// Connect, register, and start draining replies. `show_color` reproduces
+    /// the original startup red flash; reconnects skip it to avoid flashing the
+    /// LEDs mid-playback.
+    fn connect(address: &str, verbose: bool, show_color: bool) -> StdResult<Connection> {
+        let mut stream = TcpStream::connect(address)?;
+        // Hyperion frames messages as a 4-byte length plus payload, sent as two
+        // small writes, each followed by a small reply. With Nagle enabled this
+        // is a classic Nagle + delayed-ACK stall (~40ms per round trip).
+        stream.set_nodelay(true)?;
+
+        // Register before the drain thread starts reading, so it does not
+        // consume the registration confirmation.
+        register_direct(&mut stream)?;
+        read_reply(&mut stream, verbose)?;
+
+        if show_color {
+            send_color_red(&mut stream, verbose)?;
+        }
+
+        let alive = Arc::new(AtomicBool::new(true));
+        let drain_alive = Arc::clone(&alive);
+        let mut drain_stream = stream.try_clone()?;
+        let drain = thread::spawn(move || {
+            while read_reply(&mut drain_stream, false).is_ok() {}
+            drain_alive.store(false, Ordering::SeqCst);
+        });
+
+        Ok(Connection {
+            stream,
+            alive,
+            drain: Some(drain),
+        })
     }
 
-    Ok(())
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+
+    /// Send one image. On failure the connection is marked dead so the caller
+    /// reconnects.
+    fn send_image(&mut self, image: &RgbImage, verbose: bool) -> StdResult<()> {
+        let result = send_image(&mut self.stream, image, verbose);
+        if result.is_err() {
+            self.alive.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Wake the drain thread out of its blocking read, then reap it so
+        // reconnects don't leak a thread each time.
+        let _ = self.stream.shutdown(Shutdown::Both);
+        if let Some(handle) = self.drain.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Send one frame, reconnecting (rate-limited) if the connection is down.
+/// Returns true if the frame was delivered.
+fn send_frame(
+    conn: &mut Option<Connection>,
+    address: &str,
+    image: &RgbImage,
+    verbose: bool,
+    last_attempt: &mut Instant,
+) -> bool {
+    if conn.is_none() {
+        if last_attempt.elapsed() < RECONNECT_INTERVAL {
+            return false;
+        }
+        *last_attempt = Instant::now();
+        match Connection::connect(address, verbose, false) {
+            Ok(connection) => {
+                println!(">>> Reconnected to Hyperion at {}", address);
+                *conn = Some(connection);
+            }
+            Err(e) => {
+                if verbose {
+                    eprintln!("Hyperion reconnect failed: {}", e);
+                }
+                return false;
+            }
+        }
+    }
+
+    let connection = match conn.as_mut() {
+        Some(connection) => connection,
+        None => return false,
+    };
+
+    if !connection.is_alive() {
+        if verbose {
+            eprintln!("Hyperion connection closed; will reconnect.");
+        }
+        *conn = None;
+        return false;
+    }
+
+    match connection.send_image(image, verbose) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("Hyperion send failed ({}); will reconnect.", e);
+            *conn = None;
+            false
+        }
+    }
 }
 
 /// Check if HDR is active by examining connector properties.
@@ -332,8 +435,24 @@ fn main() {
 
     // Helper to update HDR mode per-frame
     let mut last_hdr_mode: Option<bool> = None;
+    let mut last_hdr_check = Instant::now();
     let mut update_hdr_mode = |card: &Card, verbose: bool| {
-        let hdr = hdr_override.unwrap_or_else(|| detect_hdr_mode(card, verbose));
+        let hdr = match hdr_override {
+            Some(hdr) => hdr,
+            None => {
+                // Auto-detection walks every connector and property, which is a
+                // burst of ioctls. The mode changes at human timescales, so poll
+                // at most once a second instead of on every captured frame.
+                if last_hdr_mode.is_none()
+                    || last_hdr_check.elapsed() >= Duration::from_secs(1)
+                {
+                    last_hdr_check = Instant::now();
+                    detect_hdr_mode(card, verbose)
+                } else {
+                    last_hdr_mode.unwrap()
+                }
+            }
+        };
         if last_hdr_mode != Some(hdr) {
             if hdr {
                 println!(">>> HDR detected - using PQ tone mapping (luminance={}, saturation={})", lum_hdr, sat_hdr);
@@ -355,26 +474,17 @@ fn main() {
             println!("No framebuffer found!");
         }
     } else {
-        let mut socket = TcpStream::connect(adress).unwrap();
-        // The Hyperion protocol frames messages as a 4-byte length followed by
-        // the payload, sent as two small writes, and every request is followed
-        // by a small reply. With Nagle enabled this becomes a classic
-        // Nagle + delayed-ACK stall of ~40ms per round trip. Disable it.
-        socket.set_nodelay(true).unwrap();
-        register_direct(&mut socket).unwrap();
-        read_reply(&mut socket, verbose).unwrap();
-
-        send_color_red(&mut socket, verbose).unwrap();
+        let mut connection = match Connection::connect(adress, verbose, true) {
+            Ok(connection) => Some(connection),
+            Err(e) => {
+                eprintln!(
+                    "Could not connect to Hyperion at {} ({}); will keep retrying.",
+                    adress, e
+                );
+                None
+            }
+        };
         thread::sleep(Duration::from_secs(1));
-
-        // Images no longer wait for a reply, so the server's replies would pile
-        // up in the receive buffer until the TCP window closes and the server
-        // blocks on write. Drain them in the background; we don't act on them.
-        let drain_socket = socket.try_clone().unwrap();
-        thread::spawn(move || {
-            let mut drain = drain_socket;
-            while read_reply(&mut drain, false).is_ok() {}
-        });
 
         let frame_time = Duration::from_secs_f64(1.0 / target_fps);
         let mut prev_samples = [0u32; 32];
@@ -382,13 +492,17 @@ fn main() {
         let mut skipped = 0u32;
         let mut frames = 0u64;
         let mut last_heartbeat = Instant::now();
+        let mut last_connect_attempt = Instant::now();
         loop {
             let start = Instant::now();
             // Update HDR mode each frame (auto-detect unless overridden)
             update_hdr_mode(&card, verbose);
-            let mut captured = false;
-            if let Some(fb) = find_framebuffer(&card, verbose) {
-                // Quick-sample to detect unchanged frames
+
+            // Build the frame to send: either the previous image (unchanged
+            // frame) or a freshly decoded one. `new_image` keeps a decoded frame
+            // alive for the duration of the send.
+            let mut new_image: Option<RgbImage> = None;
+            let image_ref: Option<&RgbImage> = if let Some(fb) = find_framebuffer(&card, verbose) {
                 if skip_unchanged {
                     if let Ok(samples) = sample_framebuffer(&card, fb) {
                         if samples == prev_samples {
@@ -396,26 +510,35 @@ fn main() {
                             if verbose {
                                 println!("Frame unchanged, resending previous ({})", skipped);
                             }
-                            if let Some(ref img) = prev_image {
-                                captured = send_dumped_image(&mut socket, img, verbose).is_ok();
-                            }
+                            prev_image.as_ref()
                         } else {
                             prev_samples = samples;
                             skipped = 0;
-                            if let Ok(img) = dump_framebuffer_to_image(&card, fb, verbose, mask_subs, border_frac) {
-                                captured = send_dumped_image(&mut socket, &img, verbose).is_ok();
-                                prev_image = Some(img);
-                            }
+                            new_image = dump_framebuffer_to_image(&card, fb, verbose, mask_subs, border_frac).ok();
+                            new_image.as_ref()
                         }
+                    } else {
+                        None
                     }
                 } else {
-                    dump_and_send_framebuffer(&mut socket, &card, fb, verbose, mask_subs, border_frac).unwrap();
-                    captured = true;
+                    new_image = dump_framebuffer_to_image(&card, fb, verbose, mask_subs, border_frac).ok();
+                    new_image.as_ref()
                 }
+            } else {
+                None
+            };
+
+            let mut captured = false;
+            if let Some(img) = image_ref {
+                captured = send_frame(&mut connection, adress, img, verbose, &mut last_connect_attempt);
+            }
+            if new_image.is_some() {
+                prev_image = new_image;
             }
             if captured {
                 frames += 1;
             }
+
             let elapsed = start.elapsed();
             if elapsed < frame_time {
                 thread::sleep(frame_time - elapsed);
