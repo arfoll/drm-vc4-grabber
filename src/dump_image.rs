@@ -448,10 +448,12 @@ fn dump_linear_to_image(
 
     let length = pitch * size.1 / (bpp / 8);
 
-    println!(
-        "linear, size: {:?}, pitch: {}, bpp: {}, length: {}",
-        size, pitch, bpp, length
-    );
+    if verbose {
+        println!(
+            "linear, size: {:?}, pitch: {}, bpp: {}, length: {}",
+            size, pitch, bpp, length
+        );
+    }
     let mut copy = vec![0u32; length as _];
     copy_buffer(card, handle, &mut copy, verbose)?;
 
@@ -481,10 +483,12 @@ fn dump_linear_xr30_to_image(
 ) -> Result<RgbImage, SystemError> {
     // Even though it's 30bpp, DRM buffers are 32-bit words per pixel.
     let length_words = (pitch * size.1) / 4;
-    println!(
-        "linear XR30, size: {:?}, pitch: {}, words: {}",
-        size, pitch, length_words
-    );
+    if verbose {
+        println!(
+            "linear XR30, size: {:?}, pitch: {}, words: {}",
+            size, pitch, length_words
+        );
+    }
 
     let mut copy = vec![0u32; length_words as _];
     copy_buffer(card, handle, &mut copy, verbose)?;
@@ -538,10 +542,12 @@ fn dump_rgb565_to_image(
 
     let length = pitch * size.1 / (bpp / 8);
 
-    println!(
-        "rgb565, size: {:?}, pitch: {}, bpp: {}, length: {}",
-        size, pitch, bpp, length
-    );
+    if verbose {
+        println!(
+            "rgb565, size: {:?}, pitch: {}, bpp: {}, length: {}",
+            size, pitch, bpp, length
+        );
+    }
     let mut copy = vec![0u16; length as _];
     copy_buffer(card, handle, &mut copy, verbose)?;
 
@@ -856,6 +862,11 @@ const MOD_I915_Y_TILED_GEN12_RC_CCS_CC: u64 = (1u64 << 56) | 8;
 /// driver (NULL context dereference) when Kodi is the master.
 struct GbmContext {
     dev: *mut ffi::gbm::gbm_device,
+    /// The DRM fd the device was created from (render node, or card as
+    /// fallback). Never read — it is held solely to keep the fd open for the
+    /// device's lifetime, since GBM does not duplicate the fd passed to
+    /// `gbm_create_device`.
+    #[allow(dead_code)]
     fd: RawFd,
 }
 
@@ -951,17 +962,6 @@ fn gbm_read_framebuffer(
         return Err(SystemError::InvalidArgument);
     }
 
-    eprintln!(
-        "[gbm] step 1: fb {}x{} fmt 0x{:x} mod 0x{:x}, {} plane(s), pitches {:?}, offsets {:?}",
-        fbinfo2.width,
-        fbinfo2.height,
-        fbinfo2.pixel_format,
-        fbinfo2.modifier[0],
-        num_planes,
-        &fbinfo2.pitches[..num_planes],
-        &fbinfo2.offsets[..num_planes]
-    );
-
     let mut import = gbm::gbm_import_fd_modifier_data {
         width: fbinfo2.width,
         height: fbinfo2.height,
@@ -988,12 +988,6 @@ fn gbm_read_framebuffer(
         GbmContext { dev, fd }
     });
     let dev = ctx.dev;
-    eprintln!(
-        "[gbm] step 2: device @ {:p} (fd {}, render node: {})",
-        dev,
-        ctx.fd,
-        ctx.fd != raw_fd
-    );
     if dev.is_null() {
         for fd in opened.iter().take(num_planes) {
             unsafe {
@@ -1013,8 +1007,6 @@ fn gbm_read_framebuffer(
             gbm::GBM_BO_USE_SCANOUT | gbm::GBM_BO_USE_RENDERING,
         )
     };
-    eprintln!("[gbm] step 3: import -> {:p}", bo);
-
     // gbm_bo_import duplicates the fds, so our copies can be closed right away.
     for fd in opened.iter().take(num_planes) {
         unsafe {
@@ -1030,7 +1022,6 @@ fn gbm_read_framebuffer(
 
     let mut stride: u32 = 0;
     let mut map_data: *mut c_void = std::ptr::null_mut();
-    eprintln!("[gbm] step 4: gbm_bo_map({}x{}x{})...", fbinfo2.width, fbinfo2.height, std::mem::size_of::<u32>() * 8);
     let ptr = unsafe {
         gbm::gbm_bo_map(
             bo,
@@ -1043,7 +1034,6 @@ fn gbm_read_framebuffer(
             &mut map_data,
         )
     };
-    eprintln!("[gbm] step 5: map -> {:p} stride {} map_data {:p}", ptr, stride, map_data);
     if ptr.is_null() {
         unsafe {
             gbm::gbm_bo_destroy(bo);
@@ -1055,7 +1045,6 @@ fn gbm_read_framebuffer(
 
     let nwords = (stride as usize * fbinfo2.height as usize) / 4;
     let mut out = vec![0u32; nwords];
-    eprintln!("[gbm] step 6: copying {} words ({} bytes)", nwords, nwords * 4);
     unsafe {
         std::ptr::copy_nonoverlapping(ptr as *const u32, out.as_mut_ptr(), nwords);
         gbm::gbm_bo_unmap(bo, map_data);

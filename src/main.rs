@@ -356,10 +356,13 @@ fn main() {
         let mut prev_samples = [0u32; 32];
         let mut prev_image: Option<RgbImage> = None;
         let mut skipped = 0u32;
+        let mut frames = 0u64;
+        let mut last_heartbeat = Instant::now();
         loop {
             let start = Instant::now();
             // Update HDR mode each frame (auto-detect unless overridden)
             update_hdr_mode(&card, verbose);
+            let mut captured = false;
             if let Some(fb) = find_framebuffer(&card, verbose) {
                 // Quick-sample to detect unchanged frames
                 if skip_unchanged {
@@ -370,24 +373,43 @@ fn main() {
                                 println!("Frame unchanged, resending previous ({})", skipped);
                             }
                             if let Some(ref img) = prev_image {
-                                let _ = send_dumped_image(&mut socket, img, verbose);
+                                captured = send_dumped_image(&mut socket, img, verbose).is_ok();
                             }
                         } else {
                             prev_samples = samples;
                             skipped = 0;
                             if let Ok(img) = dump_framebuffer_to_image(&card, fb, verbose, mask_subs, border_frac) {
-                                let _ = send_dumped_image(&mut socket, &img, verbose);
+                                captured = send_dumped_image(&mut socket, &img, verbose).is_ok();
                                 prev_image = Some(img);
                             }
                         }
                     }
                 } else {
                     dump_and_send_framebuffer(&mut socket, &card, fb, verbose, mask_subs, border_frac).unwrap();
+                    captured = true;
                 }
+            }
+            if captured {
+                frames += 1;
             }
             let elapsed = start.elapsed();
             if elapsed < frame_time {
                 thread::sleep(frame_time - elapsed);
+            }
+
+            // Quiet alive-check: a single line per minute while captures work.
+            if last_heartbeat.elapsed() >= Duration::from_secs(60) {
+                let window = last_heartbeat.elapsed().as_secs_f64();
+                if frames > 0 {
+                    println!(
+                        "capture OK: {} frames in the last minute ({:.1} fps, {} skipped)",
+                        frames,
+                        frames as f64 / window,
+                        skipped
+                    );
+                }
+                frames = 0;
+                last_heartbeat = Instant::now();
             }
         }
     }
